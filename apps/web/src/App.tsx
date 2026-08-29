@@ -1,8 +1,10 @@
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { io, type Socket } from 'socket.io-client';
-import { api, type LedgerEntry, type Member, type Player, type Room, type RoomView } from './api';
+import { api, type HandHistoryItem, type HandReplay, type LedgerEntry, type Member, type Player, type Room, type RoomView } from './api';
 import { subscribeTableAudio, tableAudio } from './audio';
 import { tableSoundEvents } from './table-sound-events';
+import { inviteCodeFromPath } from './invite-route';
+import { participantStatus, seatLayout } from './table-view';
 
 type NoticeTone = 'success' | 'error';
 type Notice = { tone: NoticeTone; text: string } | null;
@@ -12,14 +14,15 @@ type LegalActions = {
 };
 type TableSnapshot = {
   sequence: number;
-  players: Array<{ id: string; nickname: string; seat: number; stack: number; connected: boolean; folded: boolean; allIn: boolean; bet: number; contribution: number; hole?: Array<{ rank: number; suit: string }> }>;
+  players: Array<{ id: string; nickname: string; seat: number; stack: number; connected: boolean; participation: 'seated' | 'waiting' | 'sitting-out'; folded: boolean; allIn: boolean; bet: number; contribution: number; hole?: Array<{ rank: number; suit: string }> }>;
+  preparing?: { id: string; number: number; commitment: string; participantIds: string[]; readyPlayerIds: string[] };
   hand?: {
-    number: number; commitment: string; board: Array<{ rank: number; suit: string }>; street: string;
+    id: string; number: number; commitment: string; board: Array<{ rank: number; suit: string }>; street: string;
     dealerSeat: number; smallBlindSeat: number; bigBlindSeat: number; currentPlayerId?: string;
     currentBet: number; minRaise: number; status: 'active' | 'settled'; potTotal: number;
     pots: Array<{ amount: number; eligiblePlayerIds: string[] }>; legalActions?: LegalActions;
   };
-  timing?: { serverNow: number; actionDeadlineAt?: number; nextHandStartsAt?: number; waitingForPlayers?: boolean };
+  timing?: { serverNow: number; actionDeadlineAt?: number; nextHandStartsAt?: number; reconnectDeadlines?: Record<string, number>; waitingForReconnect?: boolean; waitingForPlayers?: boolean };
 };
 type HandSnapshot = NonNullable<TableSnapshot['hand']>;
 type TableActionType = 'fold' | 'check' | 'call' | 'raise';
@@ -57,6 +60,7 @@ function quickBetOptions(hand: HandSnapshot, legal: LegalActions, playerBet: num
 const cardRank = (rank: number) => rank === 14 ? 'A' : rank === 13 ? 'K' : rank === 12 ? 'Q' : rank === 11 ? 'J' : String(rank);
 const cardSuit = (suit: string) => ({ S: '♠', H: '♥', D: '♦', C: '♣' }[suit] ?? '');
 const format = (value: number) => new Intl.NumberFormat('zh-CN').format(value);
+const randomContribution = () => Array.from(crypto.getRandomValues(new Uint8Array(16)), (value) => value.toString(16).padStart(2, '0')).join('');
 
 function Icon({ name, size = 20 }: { name: 'plus' | 'lock' | 'settings' | 'arrow' | 'users' | 'copy' | 'close' | 'history' | 'sound' | 'soundOff' | 'back' | 'more' | 'refresh'; size?: number }) {
   const paths = {
@@ -84,7 +88,8 @@ function GuestGate({ onCreated }: { onCreated: (player: Player) => void }) {
 
 export function App() {
   const [player, setPlayer] = useState<Player | null | undefined>(undefined); const [rooms, setRooms] = useState<Room[]>([]);
-  const [selectedRoom, setSelectedRoom] = useState<RoomView | null>(null); const [tableOpen, setTableOpen] = useState(false); const [sheet, setSheet] = useState<'create' | 'join' | 'history' | 'settings' | null>(null); const [notice, setNotice] = useState<Notice>(null);
+  const [pendingInviteCode, setPendingInviteCode] = useState(() => inviteCodeFromPath(window.location.pathname));
+  const [selectedRoom, setSelectedRoom] = useState<RoomView | null>(null); const [tableOpen, setTableOpen] = useState(false); const [sheet, setSheet] = useState<'create' | 'join' | 'history' | 'settings' | null>(() => pendingInviteCode ? 'join' : null); const [notice, setNotice] = useState<Notice>(null);
   const audioEnabled = useSyncExternalStore(subscribeTableAudio, tableAudio.getEnabled, tableAudio.getEnabled);
   const notify = useCallback((tone: NoticeTone, text: string) => { setNotice({ tone, text }); setTimeout(() => setNotice(null), 3200); }, []);
   const refreshRooms = async () => { try { setRooms((await api.rooms()).rooms); } catch (reason) { if ((reason as Error).message.includes('游客')) setPlayer(null); else notify('error', (reason as Error).message); } };
@@ -97,7 +102,7 @@ export function App() {
     {selectedRoom ? <RoomScreen player={player} room={selectedRoom} onBack={() => { setTableOpen(false); setSelectedRoom(null); void refreshRooms(); }} onRefresh={() => refreshRoom(selectedRoom.id)} onTableChange={setTableOpen} notify={notify} /> : <Dashboard rooms={rooms} onCreate={() => setSheet('create')} onJoin={() => setSheet('join')} onOpen={openRoom} />}
     {notice && <div className={`toast ${notice.tone}`} role="status">{notice.text}</div>}
     {sheet === 'create' && <CreateRoomSheet onClose={() => setSheet(null)} onCreated={(room) => { setSheet(null); void refreshRooms(); void openRoom(room.id); notify('success', '私人房已创建'); }} notify={notify} />}
-    {sheet === 'join' && <JoinRoomSheet onClose={() => setSheet(null)} onJoined={(room) => { setSheet(null); void refreshRooms(); void openRoom(room.id); notify('success', '已加入私人房'); }} />}
+    {sheet === 'join' && <JoinRoomSheet initialCode={pendingInviteCode} onClose={() => setSheet(null)} onJoined={(room) => { setPendingInviteCode(undefined); history.replaceState(null, '', '/'); setSheet(null); void refreshRooms(); void openRoom(room.id); notify('success', '已加入私人房'); }} />}
     {sheet === 'history' && <HistorySheet onClose={() => setSheet(null)} />}
     {sheet === 'settings' && <Sheet title="设备与偏好" onClose={() => setSheet(null)}><div className="settings"><div className="settingsIdentity"><span className="avatarLarge">{player.nickname.slice(0, 1)}</span><div><strong>{player.nickname}</strong><p>设备游客身份 · 仅本机可用</p></div></div><div className="settingLine"><span><strong>音效与背景音乐</strong><small>发牌、下注、轮到你和轻柔牌桌音乐</small></span><button className={audioEnabled ? 'switch on' : 'switch'} aria-label={`音效与背景音乐已${audioEnabled ? '开启' : '关闭'}`} aria-pressed={audioEnabled} onClick={() => tableAudio.setEnabled(!audioEnabled)}><i /></button></div><button className="textAction" onClick={() => setSheet('history')}><Icon name="history" /> 查看历史结算 <Icon name="arrow" /></button></div></Sheet>}
   </main>;
@@ -113,10 +118,10 @@ function CreateRoomSheet({ onClose, onCreated, notify }: { onClose: () => void; 
   return <Sheet title="创建私人房" onClose={onClose}><p className="sheetIntro">你会成为房主，可分配初始积分、在牌局中补充积分，并控制邀请权限。</p><form onSubmit={submit} className="form"><label>房间名称<input value={name} maxLength={20} onChange={(e) => setName(e.target.value)} /></label><fieldset><legend>人数</legend><div className="choiceGrid">{([6, 9] as const).map((value) => <button type="button" key={value} className={seats === value ? 'choice selected' : 'choice'} aria-pressed={seats === value} onClick={() => setSeats(value)}>{value} 人桌</button>)}</div></fieldset><fieldset><legend>小盲 / 大盲</legend><div className="choiceGrid">{[10, 20, 50, 100].map((value) => <button type="button" key={value} className={blind === value ? 'choice selected' : 'choice'} aria-pressed={blind === value} onClick={() => setBlind(value)}>{value} / {value * 2}</button>)}</div></fieldset><label>你的初始积分<input type="number" min={blind * 2} step={blind} value={chips} onChange={(e) => setChips(Number(e.target.value))} /></label><button className="primary wide" disabled={working}>{working ? '正在创建…' : '生成邀请码'} <Icon name="arrow" /></button></form></Sheet>;
 }
 
-function JoinRoomSheet({ onClose, onJoined }: { onClose: () => void; onJoined: (room: Room) => void }) {
-  const [code, setCode] = useState(''); const [error, setError] = useState(''); const [working, setWorking] = useState(false);
+function JoinRoomSheet({ initialCode, onClose, onJoined }: { initialCode?: string; onClose: () => void; onJoined: (room: Room) => void }) {
+  const [code, setCode] = useState(initialCode ?? ''); const [error, setError] = useState(''); const [working, setWorking] = useState(false);
   const submit = async (event: FormEvent) => { event.preventDefault(); setError(''); setWorking(true); try { onJoined((await api.join(code)).room); } catch (reason) { setError((reason as Error).message); } finally { setWorking(false); } };
-  return <Sheet title="加入私人房" onClose={onClose}><p className="sheetIntro">输入好友分享的邀请码。加入后，你可以在“我的牌局”中再次进入。</p><form onSubmit={submit} className="form"><label htmlFor="inviteCode">邀请码<input id="inviteCode" value={code} placeholder="例如 RIVER-ABCDE" maxLength={12} autoCapitalize="characters" onChange={(event) => setCode(event.target.value.toUpperCase())} /></label>{error && <p className="fieldError">{error}</p>}<button className="primary wide" disabled={working}>{working ? '正在验证…' : '加入牌局'} <Icon name="arrow" /></button></form></Sheet>;
+  return <Sheet title="加入私人房" onClose={onClose}><p className="sheetIntro">输入好友分享的邀请码。加入后，你可以在“我的牌局”中再次进入。</p><form onSubmit={submit} className="form"><label htmlFor="inviteCode">邀请码<input id="inviteCode" value={code} placeholder="例如 RIVER-3XK9…" maxLength={40} autoCapitalize="characters" onChange={(event) => setCode(event.target.value.toUpperCase())} /></label>{error && <p className="fieldError">{error}</p>}<button className="primary wide" disabled={working}>{working ? '正在验证…' : '加入牌局'} <Icon name="arrow" /></button></form></Sheet>;
 }
 
 function RoomScreen({ player, room, onBack, onRefresh, onTableChange, notify }: {
@@ -183,7 +188,8 @@ function RoomScreen({ player, room, onBack, onRefresh, onTableChange, notify }: 
     try {
       const result = await api.dissolve(room.id);
       notify('success', result.room.status === 'closing' ? '将于本手结束后解散' : '房间已解散');
-      await onRefresh();
+      if (result.room.status === 'closing') await onRefresh();
+      else onBack();
     } catch (reason) {
       notify('error', (reason as Error).message);
     } finally {
@@ -199,6 +205,43 @@ function RoomScreen({ player, room, onBack, onRefresh, onTableChange, notify }: 
       notify('error', (reason as Error).message);
     }
   };
+  const rotateInvite = async () => {
+    setWorking(true);
+    try {
+      await api.rotateInvite(room.id);
+      notify('success', '邀请码已轮换，旧链接立即失效');
+      await onRefresh();
+    } catch (reason) {
+      notify('error', (reason as Error).message);
+    } finally {
+      setWorking(false);
+    }
+  };
+  const togglePause = async () => {
+    setWorking(true);
+    try {
+      const result = room.status === 'paused' ? await api.resume(room.id) : await api.pause(room.id);
+      notify('success', result.room.status === 'pausing' ? '本手结束后暂停' : result.room.status === 'paused' ? '牌局已暂停' : '牌局已恢复');
+      await onRefresh();
+    } catch (reason) {
+      notify('error', (reason as Error).message);
+    } finally {
+      setWorking(false);
+    }
+  };
+  const removeMember = async (member: Member) => {
+    if (!confirm(`确定移除 ${member.nickname} 吗？正在进行的手牌会先结算。`)) return;
+    setWorking(true);
+    try {
+      await api.removeMember(room.id, member.id);
+      notify('success', `${member.nickname} 已移除或将在本手结束后移除`);
+      await syncRoomData();
+    } catch (reason) {
+      notify('error', (reason as Error).message);
+    } finally {
+      setWorking(false);
+    }
+  };
 
   if (screen === 'table') return <TableScreen room={room} player={player} onBack={() => { onTableChange(false); setScreen('room'); void onRefresh(); }} notify={notify} />;
 
@@ -207,14 +250,18 @@ function RoomScreen({ player, room, onBack, onRefresh, onTableChange, notify }: 
       <button className="iconButton" onClick={onBack} aria-label="返回我的牌局"><Icon name="back" /></button>
       <div><p className="eyebrow">{room.isHost ? 'ROOM ADMIN' : 'INVITED PLAYER'}</p><h1>{room.name}</h1><p>{room.smallBlind} / {room.bigBlind} · {room.maxSeats} 人桌</p></div>
     </header>
-    <section className="inviteCard">
+    {room.isHost && <section className="inviteCard">
       <div><p className="eyebrow">仅受邀玩家可进入</p><strong>{room.inviteCode}</strong><p>{room.inviteOpen ? '邀请码有效，可分享给熟悉的好友' : '邀请已关闭'}</p></div>
       <div className="inviteActions"><button className="iconButton" aria-label="复制邀请码" onClick={() => copy(room.inviteCode, '邀请码')}><Icon name="copy" /></button><button className="secondary small" onClick={() => copy(`${location.origin}/join/${room.inviteCode}`, '邀请链接')}>复制链接</button></div>
-    </section>
+    </section>}
     <div className="roomButtons">
-      <button className="primary" disabled={room.status !== 'active'} onClick={() => { tableAudio.enterTable(); setScreen('table'); }}>进入牌桌 <Icon name="arrow" /></button>
+      <button className="primary" disabled={['closing', 'dissolved'].includes(room.status)} onClick={() => { tableAudio.enterTable(); setScreen('table'); }}>进入牌桌 <Icon name="arrow" /></button>
       {room.isHost && <button className={room.inviteOpen ? 'secondary' : 'secondary selectedOutline'} disabled={working} onClick={toggleInvite}><Icon name="lock" /> {room.inviteOpen ? '关闭邀请' : '开启邀请'}</button>}
     </div>
+    {room.isHost && <div className="hostControlGrid">
+      <button className="secondary small" disabled={working || !room.inviteOpen} onClick={rotateInvite}>轮换邀请码</button>
+      <button className="secondary small" disabled={working || !['active', 'paused'].includes(room.status)} onClick={togglePause}>{room.status === 'paused' ? '恢复牌局' : room.status === 'pausing' ? '等待暂停' : '暂停牌局'}</button>
+    </div>}
     <section className="sectionHeader memberSectionHeader">
       <div><h2>成员积分</h2><p>{room.isHost ? '房主可为自己和其他玩家补充积分' : '仅显示你的个人积分'}</p></div>
       <div className="memberHeaderActions">
@@ -227,17 +274,18 @@ function RoomScreen({ player, room, onBack, onRefresh, onTableChange, notify }: 
         <span className="memberAvatar">{member.nickname.slice(0, 1)}</span>
         <div className="memberInfo"><strong>{member.nickname}{member.id === player.id && '（你）'}</strong><small>{member.role === 'host' ? '房主 · 管理积分' : '受邀成员'}</small></div>
         <span className="memberChips"><small>当前积分</small><strong>{format(member.chips)}</strong></span>
-        {room.isHost && <div className="creditControl"><input aria-label={`向 ${member.nickname} 补充积分`} type="number" inputMode="numeric" min="1" step="100" placeholder="输入积分" value={creditValue(member.id)} onChange={(event) => setAmounts((state) => ({ ...state, [member.id]: event.target.value }))} /><button className="secondary compact" disabled={working || !validCreditAmount(member.id)} onClick={() => credit(member)}>补充</button></div>}
+        {room.isHost && <div className="memberControls"><div className="creditControl"><input aria-label={`向 ${member.nickname} 补充积分`} type="number" inputMode="numeric" min="1" step="100" placeholder="输入积分" value={creditValue(member.id)} onChange={(event) => setAmounts((state) => ({ ...state, [member.id]: event.target.value }))} /><button className="secondary compact" disabled={working || !validCreditAmount(member.id)} onClick={() => credit(member)}>补充</button></div>{member.id !== player.id && <button className="memberRemove" disabled={working} onClick={() => removeMember(member)}>移除</button>}</div>}
       </article>)}
     </div>
     <section className="sectionHeader slim"><div><h2>积分记录</h2><p>追加式记录，不可直接修改余额</p></div></section>
     <div className="ledgerList">
       {ledger.length ? ledger.slice(0, 8).map((entry) => {
         const targetName = memberNames.get(entry.playerId) ?? '玩家';
-        return <div className="ledgerItem" key={entry.id}><span className="ledgerGlyph"><Icon name="history" size={16} /></span><div><strong>{entry.reason === 'initial' ? `${targetName} · 初始积分` : `已向 ${targetName} 补充`}</strong><small>{new Date(entry.createdAt).toLocaleString('zh-CN')}</small></div><b>+{format(entry.amount)}</b></div>;
+        const label = entry.reason === 'initial' ? `${targetName} · 初始积分` : entry.reason === 'hand-settlement' ? `${targetName} · 手牌结算` : `已向 ${targetName} 补充`;
+        return <div className="ledgerItem" key={entry.id}><span className="ledgerGlyph"><Icon name="history" size={16} /></span><div><strong>{label}</strong><small>{new Date(entry.createdAt).toLocaleString('zh-CN')}</small></div><b>{entry.amount >= 0 ? '+' : ''}{format(entry.amount)}</b></div>;
       }) : <p className="emptyInline">暂无积分记录</p>}
     </div>
-    {room.isHost && <button className="danger" disabled={working || room.status !== 'active'} onClick={dissolve}>解散房间并生成结算记录</button>}
+    {room.isHost && <button className="danger" disabled={working || ['closing', 'dissolved'].includes(room.status)} onClick={dissolve}>解散房间并生成结算记录</button>}
   </div>;
 }
 
@@ -272,9 +320,18 @@ function SeatActionClock({ timing, isMine }: { timing: TableSnapshot['timing']; 
   return <span className={`seatCountdown ${seconds !== undefined && seconds <= 5 ? 'urgent' : ''}`} role="timer" aria-live="polite" data-phase="action" aria-label={`${isMine ? '你的' : '当前玩家'}行动剩余 ${seconds ?? '未知'} 秒`}><strong>{seconds ?? '—'}</strong><small>秒</small></span>;
 }
 
+function ReconnectClock({ playerId, timing }: { playerId: string; timing: TableSnapshot['timing'] }) {
+  const serverDeadline = timing?.reconnectDeadlines?.[playerId];
+  const deadline = useMemo(() => localDeadline(serverDeadline, timing?.serverNow), [serverDeadline, timing?.serverNow]);
+  const seconds = useCountdown(deadline);
+  if (seconds === undefined) return <i>离线</i>;
+  return <i role="timer" aria-label={`重连宽限期剩余 ${seconds} 秒`}>重连 {seconds}s</i>;
+}
+
 function NextHandClock({ timing }: { timing: TableSnapshot['timing'] }) {
   const deadline = useMemo(() => localDeadline(timing?.nextHandStartsAt, timing?.serverNow), [timing?.nextHandStartsAt, timing?.serverNow]);
   const seconds = useCountdown(deadline);
+  if (timing?.waitingForReconnect) return <div className="nextHandClock waitingForPlayers" role="status" aria-live="polite" data-phase="waiting-for-reconnect"><span>本手已结算</span><strong>等待玩家重连</strong><small>60 秒宽限期后自动暂离</small></div>;
   if (timing?.waitingForPlayers) return <div className="nextHandClock waitingForPlayers" role="status" aria-live="polite" data-phase="waiting-for-players"><span>本手已结算</span><strong>等待补充积分</strong><small>需至少 2 位有积分玩家</small></div>;
   return <div className="nextHandClock" role="timer" aria-live="polite" data-phase="next-hand"><span>本手已结算 · 下一手</span><strong>{seconds ?? '…'}</strong><small>秒</small></div>;
 }
@@ -310,28 +367,49 @@ function BetControls({ hand, legal, me, mine, onAction }: {
 }
 
 function TableScreen({ room, player, onBack, notify }: { room: RoomView; player: Player; onBack: () => void; notify: (tone: 'success' | 'error', text: string) => void }) {
-  const [snapshot, setSnapshot] = useState<TableSnapshot | null>(null); const [starting, setStarting] = useState(false); const socketRef = useRef<Socket | null>(null);
+  const [snapshot, setSnapshot] = useState<TableSnapshot | null>(null); const [starting, setStarting] = useState(false); const [auditStatus, setAuditStatus] = useState<string>(); const [handHistory, setHandHistory] = useState<HandHistoryItem[] | null>(null); const [selectedReplay, setSelectedReplay] = useState<HandReplay | null>(null); const socketRef = useRef<Socket | null>(null);
   const previousSnapshot = useRef<TableSnapshot | null>(null);
+  const contributedHands = useRef(new Set<string>());
   const audioEnabled = useSyncExternalStore(subscribeTableAudio, tableAudio.getEnabled, tableAudio.getEnabled);
   useEffect(() => { tableAudio.enterTable(); return () => tableAudio.leaveTable(); }, []);
-  useEffect(() => { const socket = io({ path: '/socket.io', transports: ['websocket'] }); socketRef.current = socket; socket.on('connect', () => socket.emit('table:join', { roomId: room.id }, (response: { ok: boolean; error?: string }) => !response.ok && notify('error', response.error ?? '无法进入牌桌'))); socket.on('table:snapshot', (next: TableSnapshot) => {
+  useEffect(() => { const socket = io({ path: '/socket.io', transports: ['websocket'] }); socketRef.current = socket; const acceptSnapshot = (next: TableSnapshot) => {
     const previous = previousSnapshot.current; const previousHand = previous?.hand; const nextHand = next.hand;
     if (previous && nextHand) {
       for (const cue of tableSoundEvents(previous, next, player.id)) tableAudio.play(cue);
       if (previousHand?.status !== 'settled' && nextHand.status === 'settled') notify('success', next.timing?.waitingForPlayers ? '本手已结算，等待至少两位有积分玩家' : '本手已结算，下一手即将自动开始');
     }
+    const preparing = next.preparing;
+    if (preparing?.participantIds.includes(player.id) && !preparing.readyPlayerIds.includes(player.id) && !contributedHands.current.has(preparing.id)) {
+      contributedHands.current.add(preparing.id);
+      socket.emit('shuffle:contribute', { handId: preparing.id, contribution: randomContribution() }, (response: { ok: boolean; error?: string }) => {
+        if (!response.ok) {
+          contributedHands.current.delete(preparing.id);
+          notify('error', response.error ?? '随机贡献提交失败');
+        }
+      });
+    }
     previousSnapshot.current = next;
     setSnapshot(next);
-  }); return () => { socket.disconnect(); }; }, [room.id, player.id, notify]);
+  }; void api.table(room.id, previousSnapshot.current?.sequence).then((result) => acceptSnapshot(result.snapshot as TableSnapshot)).catch(() => undefined); socket.on('connect', () => socket.emit('table:join', { roomId: room.id }, (response: { ok: boolean; error?: string }) => {
+    if (!response.ok) notify('error', response.error ?? '无法进入牌桌');
+    else void api.table(room.id, previousSnapshot.current?.sequence).then((result) => acceptSnapshot(result.snapshot as TableSnapshot)).catch((reason) => notify('error', (reason as Error).message));
+  })); socket.on('table:snapshot', acceptSnapshot); socket.on('table:revoked', () => { notify('error', '你已不再是该房间成员'); onBack(); }); return () => { socket.disconnect(); }; }, [room.id, player.id, notify]);
   const me = snapshot?.players.find((item) => item.id === player.id); const hand = snapshot?.hand; const legal = hand?.legalActions; const mine = hand?.currentPlayerId === player.id && !!legal;
-  const act = (type: TableActionType, amount?: number) => socketRef.current?.emit('action:submit', type === 'raise' ? { type, amount } : { type }, (response: { ok: boolean; error?: string }) => !response.ok && notify('error', response.error ?? '操作未执行'));
+  const act = (type: TableActionType, amount?: number) => {
+    if (!hand) return;
+    socketRef.current?.emit('action:submit', {
+      actionId: crypto.randomUUID(),
+      handId: hand.id,
+      version: snapshot?.sequence,
+      type,
+      ...(type === 'raise' ? { raiseTo: amount } : {})
+    }, (response: { ok: boolean; error?: string }) => !response.ok && notify('error', response.error ?? '操作未执行'));
+  };
   const heroSeat = me?.seat ?? 1;
-  const seats = useMemo(() => Array.from({ length: room.maxSeats }, (_, index) => {
-    const physicalSeat = index + 1;
-    return { physicalSeat, visualOffset: (physicalSeat - heroSeat + room.maxSeats) % room.maxSeats, player: snapshot?.players.find((item) => item.seat === physicalSeat) };
-  }), [heroSeat, room.maxSeats, snapshot]);
-  const readyPlayerCount = snapshot?.players.filter((item) => item.stack > 0).length ?? 0;
-  const canStart = room.isHost && !hand && readyPlayerCount >= 2;
+  const waitingCount = snapshot?.players.filter((item) => item.seat === 0 && item.participation === 'waiting').length ?? 0;
+  const seats = useMemo(() => seatLayout(room.maxSeats, heroSeat, snapshot?.players ?? []), [heroSeat, room.maxSeats, snapshot?.players]);
+  const readyPlayerCount = snapshot?.players.filter((item) => item.stack > 0 && item.participation !== 'sitting-out').length ?? 0;
+  const canStart = room.isHost && !hand && !snapshot?.preparing && readyPlayerCount >= 2;
   const startHand = () => { if (!socketRef.current) return; setStarting(true); socketRef.current.emit('table:start', (response: { ok: boolean; error?: string }) => { setStarting(false); if (!response.ok) notify('error', response.error ?? '无法开始牌局'); }); };
   const positionLabel = (seat: number) => {
     if (!hand) return undefined;
@@ -339,22 +417,59 @@ function TableScreen({ room, player, onBack, notify }: { room: RoomView; player:
     return labels.join('·') || undefined;
   };
   const showPotBreakdown = hand?.pots.slice(1).some((pot) => pot.eligiblePlayerIds.length > 1);
+  const toggleParticipation = async () => {
+    try {
+      if (me?.participation === 'sitting-out') await api.sitIn(room.id); else await api.sitOut(room.id);
+      socketRef.current?.emit('table:sync');
+    } catch (reason) { notify('error', (reason as Error).message); }
+  };
+  const verifyAudit = async () => {
+    if (!hand) return;
+    try {
+      const { audit } = await api.audit(room.id, hand.id);
+      const commitmentBytes = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(`${audit.algorithmVersion}:${audit.serverSeed}`));
+      const localCommitment = [...new Uint8Array(commitmentBytes)].map((value) => value.toString(16).padStart(2, '0')).join('');
+      if (localCommitment !== audit.commitment) throw new Error('本地洗牌承诺校验失败');
+      const verification = await api.verifyAudit(room.id, hand.id);
+      if (!verification.verified) throw new Error('发牌、底池或派奖验证失败');
+      setAuditStatus(`本地承诺与完整复算通过 · ${new Date(verification.expiresAt).toLocaleDateString('zh-CN')} 前可查`);
+    } catch (reason) { notify('error', (reason as Error).message); }
+  };
+  const openHandHistory = async () => {
+    try { setHandHistory((await api.hands(room.id)).hands); }
+    catch (reason) { notify('error', (reason as Error).message); }
+  };
+  const openReplay = async (handId: string) => {
+    try { setSelectedReplay((await api.replay(room.id, handId)).replay); }
+    catch (reason) { notify('error', (reason as Error).message); }
+  };
+  const downloadAudit = async (handId: string) => {
+    try {
+      const { audit } = await api.audit(room.id, handId);
+      const url = URL.createObjectURL(new Blob([JSON.stringify(audit, null, 2)], { type: 'application/json' }));
+      const link = document.createElement('a'); link.href = url; link.download = `river-hand-${audit.handNumber}-audit.json`; link.click(); URL.revokeObjectURL(url);
+    } catch (reason) { notify('error', (reason as Error).message); }
+  };
   return <div className="tableScreen">
-    <header className="tableHeader"><button className="iconButton" aria-label="返回房间" onClick={onBack}><Icon name="back" /></button><div><strong>{room.name}</strong><span>{room.smallBlind} / {room.bigBlind} · {hand ? `第 ${hand.number} 手` : '等待玩家入桌'}</span></div><button className={`iconButton audioToggle ${audioEnabled ? '' : 'muted'}`} aria-label={`音效与背景音乐已${audioEnabled ? '开启' : '关闭'}`} aria-pressed={audioEnabled} onClick={() => { const next = !audioEnabled; tableAudio.setEnabled(next); if (next) tableAudio.play('turn'); }}><Icon name={audioEnabled ? 'sound' : 'soundOff'} /></button></header>
+    <header className="tableHeader"><button className="iconButton" aria-label="返回房间" onClick={onBack}><Icon name="back" /></button><div><strong>{room.name}</strong><span>{room.smallBlind} / {room.bigBlind} · {hand ? `第 ${hand.number} 手` : '等待玩家入桌'}</span></div><button className="iconButton" aria-label="手牌记录" onClick={() => void openHandHistory()}><Icon name="history" /></button><button className="seatToggle" onClick={toggleParticipation}>{me?.participation === 'sitting-out' ? '坐入' : '暂离'}</button><button className={`iconButton audioToggle ${audioEnabled ? '' : 'muted'}`} aria-label={`音效与背景音乐已${audioEnabled ? '开启' : '关闭'}`} aria-pressed={audioEnabled} onClick={() => { const next = !audioEnabled; tableAudio.setEnabled(next); if (next) tableAudio.play('turn'); }}><Icon name={audioEnabled ? 'sound' : 'soundOff'} /></button></header>
     <div className="tableArea" data-table-size={room.maxSeats}>
       <div className="privateStrip"><Icon name="lock" size={13} /> 仅受邀玩家可进入</div><div className="felt"><div className="feltInner" /></div>
+      {me?.seat === 0 && me.participation === 'waiting' && <div className="waitingNotice" role="status"><strong>正在候补座位</strong><span>本手不参与发牌；结算后按进入顺序坐入{waitingCount > 1 ? ` · 当前 ${waitingCount} 人等待` : ''}</span></div>}
       {hand && <div className="pot"><span>总底池</span><b>{format(hand.potTotal)}</b>{showPotBreakdown && <small>{hand.pots.map((pot, index) => `${index === 0 ? '主池' : `边池${index}`} ${format(pot.amount)}`).join(' · ')}</small>}</div>}
       {hand?.status === 'settled' && <NextHandClock timing={snapshot?.timing} />}
+      {hand?.status === 'settled' && me?.hole?.length === 2 && <button className="auditButton" onClick={verifyAudit}>{auditStatus ?? '验证本手发牌'}</button>}
       <div className="board" aria-label="公共牌">{Array.from({ length: 5 }, (_, index) => { const card = hand?.board[index]; return <div className={card ? `playingCard ${card.suit === 'H' || card.suit === 'D' ? 'red' : ''}` : 'playingCard blank'} key={index}>{card && <><span>{cardRank(card.rank)}</span><b>{cardSuit(card.suit)}</b></>}</div>; })}</div>
       <div className="seatRing">{seats.map(({ player: seat, physicalSeat, visualOffset }) => {
         const isTurn = hand?.status === 'active' && hand.currentPlayerId === seat?.id;
         const badge = positionLabel(physicalSeat);
-        return <div className={`seat relativeSeat${visualOffset} ${seat?.id === player.id ? 'local' : ''} ${seat?.folded ? 'folded' : ''} ${isTurn ? 'activeTurn' : ''}`} data-physical-seat={physicalSeat} data-visual-offset={visualOffset} key={physicalSeat}>{seat ? <><span className="seatAvatarWrap"><span className="seatAvatar">{seat.nickname.slice(0, 1)}</span>{badge && <span className="positionBadge">{badge}</span>}{isTurn && <SeatActionClock timing={snapshot?.timing} isMine={seat.id === player.id} />}</span><span className="seatLabel"><b>{seat.nickname}{seat.id === player.id && '（你）'}</b>{seat.folded ? '已弃牌' : seat.allIn ? '全下' : format(seat.stack)}{!seat.connected && <i>离线</i>}</span>{seat.bet > 0 && <span className="seatBet">已投入 {format(seat.bet)}</span>}</> : <span className="openSeat">空位</span>}</div>;
+        const status = seat && participantStatus(seat);
+        return <div className={`seat relativeSeat${visualOffset} ${seat?.id === player.id ? 'local' : ''} ${seat?.folded ? 'folded' : ''} ${isTurn ? 'activeTurn' : ''}`} data-physical-seat={physicalSeat} data-visual-offset={visualOffset} data-participation={seat?.participation} key={physicalSeat}>{seat ? <><span className="seatAvatarWrap"><span className="seatAvatar">{seat.nickname.slice(0, 1)}</span>{badge && <span className="positionBadge">{badge}</span>}{isTurn && <SeatActionClock timing={snapshot?.timing} isMine={seat.id === player.id} />}</span><span className="seatLabel"><b>{seat.nickname}{seat.id === player.id && '（你）'}</b>{seat.folded ? '已弃牌' : seat.allIn ? '全下' : format(seat.stack)}{!seat.connected ? <ReconnectClock playerId={seat.id} timing={snapshot?.timing} /> : status && <i>{status}</i>}</span>{seat.bet > 0 && <span className="seatBet">已投入 {format(seat.bet)}</span>}</> : <span className="openSeat">空位</span>}</div>;
       })}</div>
       {me?.hole && <div className="holeCards" aria-label="你的手牌">{me.hole.map((card, index) => <div key={index} className={`playingCard personal ${card.suit === 'H' || card.suit === 'D' ? 'red' : ''}`}><span>{cardRank(card.rank)}</span><b>{cardSuit(card.suit)}</b></div>)}</div>}
-      {!hand && <div className="waiting"><Icon name="users" size={26} /><strong>{canStart ? '牌桌已就绪' : '等待至少一位受邀好友入桌'}</strong><p>{canStart ? `已有 ${readyPlayerCount} 位有积分玩家入桌，请由房主开始第一手。` : '至少两位有积分的受邀玩家入桌后，房主即可开始牌局。'}</p>{room.isHost && <button className="primary tableStartButton" disabled={!canStart || starting} onClick={startHand}>{starting ? '正在开始…' : '开始第一手'} <Icon name="arrow" /></button>}</div>}
+      {!hand && <div className="waiting"><Icon name="users" size={26} /><strong>{snapshot?.preparing ? '正在收集本手随机贡献' : canStart ? '牌桌已就绪' : '等待至少一位受邀好友入桌'}</strong><p>{snapshot?.preparing ? `服务端已提交洗牌承诺，等待 ${snapshot.preparing.participantIds.length - snapshot.preparing.readyPlayerIds.length} 位玩家完成贡献。` : canStart ? `已有 ${readyPlayerCount} 位有积分玩家入桌，请由房主开始第一手。` : '至少两位有积分的受邀玩家入桌后，房主即可开始牌局。'}</p>{room.isHost && <button className="primary tableStartButton" disabled={!canStart || starting} onClick={startHand}>{starting ? '正在开始…' : '开始第一手'} <Icon name="arrow" /></button>}</div>}
     </div>
     <BetControls key={`${hand?.number ?? 0}:${hand?.street ?? 'waiting'}:${hand?.currentPlayerId ?? 'none'}:${hand?.currentBet ?? 0}:${me?.bet ?? 0}`} hand={hand} legal={legal} me={me} mine={mine} onAction={act} />
+    {handHistory && <Sheet title="最近 10 天手牌" onClose={() => { setHandHistory(null); setSelectedReplay(null); }}><div className="historyList">{handHistory.length ? handHistory.map((item) => <button className="historyRow handHistoryRow" key={item.handId} onClick={() => void openReplay(item.handId)}><span className="ledgerGlyph"><Icon name="history" /></span><div><strong>第 {item.handNumber} 手 · {item.settledBy === 'showdown' ? '摊牌' : '弃牌结束'}</strong><small>{new Date(item.settledAt).toLocaleString('zh-CN')} · {item.participants.map((participant) => `${participant.nickname} ${item.pointDeltas[participant.id] >= 0 ? '+' : ''}${item.pointDeltas[participant.id]}`).join(' / ')}</small></div><b>{item.pots.reduce((sum, pot) => sum + pot.amount, 0)}</b></button>) : <div className="emptyState compactEmpty"><Icon name="history" size={28} /><h3>暂无手牌记录</h3><p>结算后的手牌会在这里保留 10 天。</p></div>}</div>{selectedReplay && <article className="replayDetail"><h3>第 {selectedReplay.handNumber} 手回放</h3><p>盲注：{selectedReplay.blinds.small} / {selectedReplay.blinds.big}</p><p>公共牌：{selectedReplay.board.length ? selectedReplay.board.map((card) => `${cardRank(card.rank)}${cardSuit(card.suit)}`).join(' ') : '无'}</p><button className="secondary small" onClick={() => void downloadAudit(selectedReplay.handId)}>下载完整审计材料</button><h4>结果与积分变化</h4>{selectedReplay.players.map((replayPlayer) => <p key={replayPlayer.id}>{replayPlayer.nickname}：{replayPlayer.pointDelta >= 0 ? '+' : ''}{replayPlayer.pointDelta}{replayPlayer.hole ? ` · ${replayPlayer.hole.map((card) => `${cardRank(card.rank)}${cardSuit(card.suit)}`).join(' ')}` : ''}</p>)}<p>{selectedReplay.result.pots.map((pot, index) => `${index === 0 ? '主池' : `边池 ${index}`} ${pot.amount}`).join(' · ')}</p><h4>动作时间线</h4><ol className="replayTimeline">{selectedReplay.events.map((event) => <li key={event.sequence}><b>#{event.sequence} {event.type}</b><span>{JSON.stringify(event.payload)}</span></li>)}</ol></article>}</Sheet>}
   </div>;
 }
 

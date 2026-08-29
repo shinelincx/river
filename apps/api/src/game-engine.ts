@@ -1,9 +1,11 @@
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 
 export type Suit = 'S' | 'H' | 'D' | 'C';
 export type Card = { rank: number; suit: Suit };
 export type Action = { type: 'fold' | 'check' | 'call' | 'raise'; amount?: number };
+export type ActionCommand = { actionId: string; handId: string; version: number; type: string; raiseTo?: number };
 export type Street = 'preflop' | 'flop' | 'turn' | 'river' | 'showdown';
+export type Participation = 'seated' | 'waiting' | 'sitting-out';
 export type PotView = { amount: number; eligiblePlayerIds: string[] };
 export type LegalActions = {
   canFold: boolean;
@@ -23,6 +25,7 @@ export type GamePlayer = {
   seat: number;
   stack: number;
   connected: boolean;
+  participation: Participation;
   folded: boolean;
   allIn: boolean;
   bet: number;
@@ -30,12 +33,52 @@ export type GamePlayer = {
   hole: Card[];
 };
 
-type EngineEvent = { sequence: number; type: string; payload: Record<string, unknown> };
+export type EngineEvent = { sequence: number; type: string; payload: Record<string, unknown> };
+export type SubmitActionResult = { accepted: boolean; sequence: number };
+export type HandAudit = {
+  handId: string;
+  roomId: string;
+  handNumber: number;
+  algorithmVersion: 'river-shuffle-v1';
+  serverSeed: string;
+  commitment: string;
+  playerContributions: Record<string, string>;
+  participantIds: string[];
+  dealOrder: string[];
+  seatByPlayerId: Record<string, number>;
+  dealerSeat: number;
+  maxSeats: number;
+  smallBlind: number;
+  bigBlind: number;
+  foldedPlayerIds: string[];
+  contributionsBeforeRefund: Record<string, number>;
+  finalContributions: Record<string, number>;
+  deck: Card[];
+  holeCards: Record<string, Card[]>;
+  board: Card[];
+  events: EngineEvent[];
+  result: { pots: PotView[]; refund?: { playerId: string; amount: number }; payouts: Record<string, number>; settledBy: 'fold' | 'showdown' };
+  settledAt: string;
+  expiresAt: string;
+};
+type PreparingHandState = {
+  id: string;
+  number: number;
+  seed: string;
+  commitment: string;
+  participantIds: string[];
+  contributions: Map<string, string>;
+};
 type HandState = {
+  id: string;
   number: number;
   seed: string;
   commitment: string;
   deck: Card[];
+  fullDeck: Card[];
+  playerContributions: Record<string, string>;
+  participantIds: string[];
+  startedEventSequence: number;
   board: Card[];
   street: Street;
   dealerSeat: number;
@@ -48,6 +91,23 @@ type HandState = {
   actedAtBet: Map<string, number>;
   status: 'active' | 'settled';
   settledBy?: 'fold' | 'showdown';
+};
+export type SerializedTableState = {
+  roomId: string;
+  smallBlind: number;
+  bigBlind: number;
+  maxSeats: 6 | 9;
+  players: GamePlayer[];
+  events: EngineEvent[];
+  preparing?: Omit<PreparingHandState, 'contributions'> & { contributions: Array<[string, string]> };
+  hand?: Omit<HandState, 'pending' | 'actedAtBet'> & { pending: string[]; actedAtBet: Array<[string, number]> };
+  eventSequence: number;
+  handNumber: number;
+  lastDealerSeat: number;
+  actionResults: Array<[string, { handId: string; sequence: number }]>;
+  /** Legacy pre-commit contributions are intentionally ignored when restoring. */
+  shuffleContributions?: Array<[string, string]>;
+  audits: HandAudit[];
 };
 
 const SUITS: Suit[] = ['S', 'H', 'D', 'C'];
@@ -63,16 +123,147 @@ function nextSeat(players: GamePlayer[], from: number, predicate = (_: GamePlaye
   return player;
 }
 
-function shuffledDeck(): { seed: string; deck: Card[]; commitment: string } {
-  const seed = randomBytes(32).toString('hex');
+const SHUFFLE_ALGORITHM_VERSION = 'river-shuffle-v1' as const;
+const TEN_DAYS_MS = 10 * 24 * 60 * 60 * 1000;
+const PRIVATE_EVENT_KEYS = new Set(['seed', 'serverSeed', 'deck', 'fullDeck', 'holeCards', 'playerContributions']);
+
+export function publicEngineEvent(event: EngineEvent | undefined): EngineEvent | undefined {
+  if (!event) return undefined;
+  return {
+    ...event,
+    payload: Object.fromEntries(Object.entries(event.payload).filter(([key]) => !PRIVATE_EVENT_KEYS.has(key)))
+  };
+}
+
+export function deterministicDeck(serverSeed: string, playerContributions: Record<string, string>, handId: string): Card[] {
   const deck = SUITS.flatMap((suit) => Array.from({ length: 13 }, (_, i) => ({ rank: i + 2, suit })));
-  // The randomness is server-only and committed before any action is accepted.
+  const participantEntropy = Object.entries(playerContributions).sort(([a], [b]) => a.localeCompare(b)).map(([id, value]) => `${id}:${value}`).join('|');
   for (let index = deck.length - 1; index > 0; index--) {
-    const random = randomBytes(4).readUInt32BE(0) % (index + 1);
+    const random = createHash('sha256')
+      .update(`${SHUFFLE_ALGORITHM_VERSION}:${serverSeed}:${handId}:${participantEntropy}:${index}`)
+      .digest()
+      .readUInt32BE(0) % (index + 1);
     [deck[index], deck[random]] = [deck[random], deck[index]];
   }
-  const commitment = createHash('sha256').update(`${seed}:${deck.map(cardText).join(',')}`).digest('hex');
-  return { seed, deck, commitment };
+  return deck;
+}
+
+function serverCommitment(): { seed: string; commitment: string } {
+  const seed = randomBytes(32).toString('hex');
+  const commitment = createHash('sha256').update(`${SHUFFLE_ALGORITHM_VERSION}:${seed}`).digest('hex');
+  return { seed, commitment };
+}
+
+export function verifyHandAudit(audit: HandAudit, trustedCommitment?: string): boolean {
+  const commitment = createHash('sha256').update(`${audit.algorithmVersion}:${audit.serverSeed}`).digest('hex');
+  if (commitment !== audit.commitment) return false;
+  if (trustedCommitment !== undefined && trustedCommitment !== audit.commitment) return false;
+  const shuffleEvents = audit.events.filter((event) => event.type === 'shuffle_committed');
+  const startedEvents = audit.events.filter((event) => event.type === 'hand_started');
+  const settlementEvents = audit.events.filter((event) => event.type === 'hand_settled');
+  if (shuffleEvents.length !== 1 || startedEvents.length !== 1 || settlementEvents.length !== 1) return false;
+  const identityEvents = [shuffleEvents[0], startedEvents[0], settlementEvents[0]];
+  if (identityEvents.some((event) => event.payload.handId !== audit.handId || event.payload.commitment !== audit.commitment)) return false;
+  if (shuffleEvents[0].payload.number !== audit.handNumber || startedEvents[0].payload.number !== audit.handNumber) return false;
+  if (shuffleEvents[0].payload.algorithmVersion !== audit.algorithmVersion || startedEvents[0].payload.algorithmVersion !== audit.algorithmVersion) return false;
+  if (startedEvents[0].payload.dealerSeat !== audit.dealerSeat) return false;
+  const committedParticipants = shuffleEvents[0].payload.participantIds;
+  if (!Array.isArray(committedParticipants)
+    || JSON.stringify([...committedParticipants].sort()) !== JSON.stringify([...audit.participantIds].sort())) return false;
+  const reconstructed = deterministicDeck(audit.serverSeed, audit.playerContributions, audit.handId);
+  if (reconstructed.map(cardText).join(',') !== audit.deck.map(cardText).join(',')) return false;
+
+  const deck = structuredClone(reconstructed);
+  for (const playerId of audit.dealOrder) {
+    const expected = [deck.pop()!, deck.pop()!];
+    if (expected.map(cardText).join(',') !== audit.holeCards[playerId]?.map(cardText).join(',')) return false;
+  }
+  const expectedBoard = Array.from({ length: audit.board.length }, () => deck.pop()!);
+  if (expectedBoard.map(cardText).join(',') !== audit.board.map(cardText).join(',')) return false;
+
+  const replayedContributions = Object.fromEntries(audit.participantIds.map((id) => [id, 0]));
+  const seenActionIds = new Set<string>();
+  const foldedFromActions = new Set<string>();
+  for (const event of audit.events) {
+    if (event.type === 'blinds_posted') {
+      const smallId = event.payload.smallBlindPlayerId as string;
+      const bigId = event.payload.bigBlindPlayerId as string;
+      replayedContributions[smallId] = Number(event.payload.smallBlindAmount);
+      replayedContributions[bigId] = Number(event.payload.bigBlindAmount);
+    }
+    if (event.type === 'action') {
+      const actionId = event.payload.actionId as string;
+      const playerId = event.payload.playerId as string;
+      const actionKey = `${playerId}:${actionId}`;
+      if (!actionId || seenActionIds.has(actionKey)) return false;
+      seenActionIds.add(actionKey);
+      const committedAmount = Number(event.payload.committedAmount);
+      if (!Number.isSafeInteger(committedAmount) || committedAmount < 0 || !(playerId in replayedContributions)) return false;
+      replayedContributions[playerId] += committedAmount;
+      if (replayedContributions[playerId] !== event.payload.contributionAfter) return false;
+      if (event.payload.type === 'fold') foldedFromActions.add(playerId);
+    }
+  }
+  if (JSON.stringify(sortedRecord(replayedContributions)) !== JSON.stringify(sortedRecord(audit.contributionsBeforeRefund))) return false;
+
+  const ranked = Object.entries(audit.contributionsBeforeRefund).filter(([, amount]) => amount > 0).sort(([, a], [, b]) => b - a);
+  const expectedFinal = { ...audit.contributionsBeforeRefund };
+  const expectedRefund = ranked.length > 0 && ranked[0][1] > (ranked[1]?.[1] ?? 0)
+    ? { playerId: ranked[0][0], amount: ranked[0][1] - (ranked[1]?.[1] ?? 0) }
+    : undefined;
+  if (expectedRefund) expectedFinal[expectedRefund.playerId] -= expectedRefund.amount;
+  if (JSON.stringify(expectedRefund) !== JSON.stringify(audit.result.refund)) return false;
+  if (JSON.stringify(sortedRecord(expectedFinal)) !== JSON.stringify(sortedRecord(audit.finalContributions))) return false;
+
+  if (JSON.stringify([...foldedFromActions].sort()) !== JSON.stringify([...audit.foldedPlayerIds].sort())) return false;
+  const remainingPlayerIds = audit.participantIds.filter((playerId) => !foldedFromActions.has(playerId));
+  const expectedSettledBy = remainingPlayerIds.length === 1 ? 'fold' : 'showdown';
+  if (audit.result.settledBy !== expectedSettledBy || (expectedSettledBy === 'showdown' && audit.board.length !== 5)) return false;
+  if (settlementEvents[0].payload.settledBy !== expectedSettledBy) return false;
+
+  const folded = foldedFromActions;
+  const pots = potBreakdownFrom(audit.finalContributions, folded);
+  if (JSON.stringify(pots) !== JSON.stringify(audit.result.pots)) return false;
+  const payouts: Record<string, number> = {};
+  for (const pot of pots) {
+    const eligible = pot.eligiblePlayerIds;
+    if (eligible.length === 0) return false;
+    const winners = eligible.length === 1 ? eligible : (() => {
+      const ranks = eligible.map((playerId) => ({ playerId, rank: evaluateSeven([...(audit.holeCards[playerId] ?? []), ...audit.board]) }));
+      const best = ranks.reduce((winner, item) => compareRanks(item.rank, winner) > 0 ? item.rank : winner, ranks[0].rank);
+      return ranks.filter((item) => compareRanks(item.rank, best) === 0).map((item) => item.playerId);
+    })();
+    const ordered = [...winners].sort((a, b) => leftOfButtonDistance(audit.seatByPlayerId[a], audit.dealerSeat, audit.maxSeats) - leftOfButtonDistance(audit.seatByPlayerId[b], audit.dealerSeat, audit.maxSeats));
+    const share = Math.floor(pot.amount / ordered.length);
+    let remainder = pot.amount % ordered.length;
+    for (const winner of ordered) payouts[winner] = (payouts[winner] ?? 0) + share + (remainder-- > 0 ? 1 : 0);
+  }
+  if (JSON.stringify(sortedRecord(payouts)) !== JSON.stringify(sortedRecord(audit.result.payouts))) return false;
+  const settlement = settlementEvents[0].payload;
+  if (!settlement.payouts || typeof settlement.payouts !== 'object') return false;
+  return JSON.stringify(settlement.board) === JSON.stringify(audit.board)
+    && JSON.stringify(settlement.pots) === JSON.stringify(pots)
+    && JSON.stringify(settlement.refund) === JSON.stringify(expectedRefund)
+    && JSON.stringify(sortedRecord(settlement.payouts as Record<string, number>)) === JSON.stringify(sortedRecord(payouts));
+}
+
+function sortedRecord<T>(record: Record<string, T>): Record<string, T> {
+  return Object.fromEntries(Object.entries(record).sort(([a], [b]) => a.localeCompare(b)));
+}
+
+function potBreakdownFrom(contributions: Record<string, number>, folded: Set<string>): PotView[] {
+  const levels = [...new Set(Object.values(contributions).filter((amount) => amount > 0))].sort((a, b) => a - b);
+  let previous = 0;
+  return levels.map((level) => {
+    const involved = Object.entries(contributions).filter(([, amount]) => amount >= level).map(([id]) => id);
+    const amount = (level - previous) * involved.length;
+    previous = level;
+    return { amount, eligiblePlayerIds: involved.filter((id) => !folded.has(id)) };
+  }).filter((pot) => pot.amount > 0);
+}
+
+function leftOfButtonDistance(seat: number, dealerSeat: number, maxSeats: number): number {
+  return (seat - dealerSeat + maxSeats) % maxSeats || maxSeats;
 }
 
 function combinations<T>(items: T[], size: number): T[][] {
@@ -118,21 +309,90 @@ export function evaluateSeven(cards: Card[]): number[] {
 export class PokerTable {
   readonly players: GamePlayer[] = [];
   readonly events: EngineEvent[] = [];
+  private preparing?: PreparingHandState;
   private hand?: HandState;
   private eventSequence = 0;
   private handNumber = 0;
   private lastDealerSeat = 0;
+  private readonly actionResults = new Map<string, { handId: string; sequence: number }>();
+  private readonly audits = new Map<string, HandAudit>();
 
   constructor(readonly roomId: string, readonly smallBlind: number, readonly bigBlind: number, readonly maxSeats: 6 | 9) {}
+
+  exportState(): SerializedTableState {
+    const hand = this.hand && {
+      ...structuredClone({ ...this.hand, pending: undefined, actedAtBet: undefined }),
+      pending: [...this.hand.pending],
+      actedAtBet: [...this.hand.actedAtBet.entries()]
+    } as SerializedTableState['hand'];
+    return {
+      roomId: this.roomId,
+      smallBlind: this.smallBlind,
+      bigBlind: this.bigBlind,
+      maxSeats: this.maxSeats,
+      players: structuredClone(this.players),
+      events: structuredClone(this.events),
+      preparing: this.preparing && {
+        ...structuredClone({ ...this.preparing, contributions: undefined }),
+        contributions: [...this.preparing.contributions.entries()]
+      },
+      hand,
+      eventSequence: this.eventSequence,
+      handNumber: this.handNumber,
+      lastDealerSeat: this.lastDealerSeat,
+      actionResults: structuredClone([...this.actionResults.entries()]),
+      audits: structuredClone([...this.audits.values()])
+    };
+  }
+
+  static fromState(state: SerializedTableState): PokerTable {
+    const table = new PokerTable(state.roomId, state.smallBlind, state.bigBlind, state.maxSeats);
+    table.players.push(...structuredClone(state.players));
+    table.events.push(...state.events.map((event) => publicEngineEvent(structuredClone(event))!));
+    table.preparing = state.preparing && {
+      ...structuredClone(state.preparing),
+      contributions: new Map(state.preparing.contributions)
+    };
+    table.hand = state.hand && {
+      ...structuredClone(state.hand),
+      pending: new Set(state.hand.pending),
+      actedAtBet: new Map(state.hand.actedAtBet)
+    };
+    if (table.hand?.status === 'settled') {
+      table.hand.seed = '';
+      table.hand.deck = [];
+      table.hand.fullDeck = [];
+      table.hand.playerContributions = {};
+      const retainedAudit = state.audits.find((audit) => audit.handId === table.hand?.id);
+      if (retainedAudit) {
+        for (const player of table.players) player.hole = structuredClone(retainedAudit.holeCards[player.id] ?? []);
+        const eventsBySequence = new Map(table.events.map((event) => [event.sequence, event]));
+        for (const event of retainedAudit.events) {
+          const publicEvent = publicEngineEvent(structuredClone(event));
+          if (publicEvent) eventsBySequence.set(publicEvent.sequence, publicEvent);
+        }
+        table.events.splice(0, table.events.length, ...[...eventsBySequence.values()].sort((left, right) => left.sequence - right.sequence));
+      } else {
+        for (const player of table.players) player.hole = [];
+      }
+    }
+    table.eventSequence = state.eventSequence;
+    table.handNumber = state.handNumber;
+    table.lastDealerSeat = state.lastDealerSeat;
+    for (const [key, value] of state.actionResults) table.actionResults.set(key, structuredClone(value));
+    for (const audit of state.audits) table.audits.set(audit.handId, structuredClone(audit));
+    return table;
+  }
 
   addPlayer(input: { id: string; nickname: string; stack: number }): GamePlayer {
     const existing = this.players.find((player) => player.id === input.id);
     if (existing) { existing.connected = true; return existing; }
-    if (this.players.length >= this.maxSeats) throw new Error('牌桌已满');
-    const used = new Set(this.players.map((player) => player.seat));
+    const used = new Set(this.players.map((player) => player.seat).filter((seat) => seat > 0));
     const seat = Array.from({ length: this.maxSeats }, (_, i) => i + 1).find((value) => !used.has(value));
-    if (!seat) throw new Error('牌桌已满');
-    const player: GamePlayer = { ...input, seat, connected: true, folded: false, allIn: false, bet: 0, contribution: 0, hole: [] };
+    const participation: Participation = input.stack <= 0
+      ? 'sitting-out'
+      : this.hand?.status === 'active' || this.preparing || !seat ? 'waiting' : 'seated';
+    const player: GamePlayer = { ...input, seat: participation === 'waiting' && (this.hand?.status === 'active' || this.preparing) ? 0 : (seat ?? 0), connected: true, participation, folded: false, allIn: false, bet: 0, contribution: 0, hole: [] };
     this.players.push(player);
     this.record('player_joined', { playerId: player.id, seat: player.seat });
     return player;
@@ -142,19 +402,196 @@ export class PokerTable {
     const player = this.player(playerId);
     player.connected = connected;
     this.record('presence', { playerId, connected });
+    if (!connected && this.preparing?.participantIds.includes(playerId)) this.cancelPreparation('participant_disconnected');
+  }
+
+  setShuffleContribution(playerId: string, handId: string, contribution: string): void {
+    this.player(playerId);
+    const preparing = this.preparing;
+    if (!preparing) throw new Error('当前没有等待随机贡献的手牌');
+    if (handId !== preparing.id) throw new Error('随机贡献不属于当前手牌');
+    if (!preparing.participantIds.includes(playerId)) throw new Error('你不是本手候选参与者');
+    if (preparing.contributions.has(playerId)) throw new Error('本手随机贡献已提交');
+    if (typeof contribution !== 'string' || contribution.length < 16 || contribution.length > 128) throw new Error('随机贡献无效');
+    preparing.contributions.set(playerId, contribution);
+    this.record('shuffle_contribution_ready', { handId, playerId });
+    if (preparing.participantIds.every((id) => preparing.contributions.has(id))) this.dealPreparedHand();
+  }
+
+  sitOut(playerId: string): void {
+    const player = this.player(playerId);
+    if (player.participation === 'sitting-out') return;
+    if (this.preparing?.participantIds.includes(playerId)) this.cancelPreparation('participant_sat_out');
+    player.participation = 'sitting-out';
+    this.record('player_sat_out', { playerId });
+  }
+
+  sitIn(playerId: string): void {
+    const player = this.player(playerId);
+    if (player.stack <= 0) throw new Error('积分不足，无法坐入');
+    player.participation = this.hand?.status === 'active' || this.preparing || player.seat === 0 ? 'waiting' : 'seated';
+    this.record('player_sat_in', { playerId, participation: player.participation });
+  }
+
+  removePlayer(playerId: string): void {
+    if (this.hand?.status === 'active' || this.preparing) throw new Error('成员只能在手牌边界移除');
+    const index = this.players.findIndex((player) => player.id === playerId);
+    if (index < 0) return;
+    this.players.splice(index, 1);
+    this.record('player_removed', { playerId });
+  }
+
+  cancelPreparation(reason: string): void {
+    if (!this.preparing) return;
+    const handId = this.preparing.id;
+    this.preparing = undefined;
+    this.record('shuffle_preparation_cancelled', { handId, reason });
+  }
+
+  hasDisconnectedSeatedPlayers(): boolean {
+    return this.players.some((player) => !player.connected && player.stack > 0 && player.seat > 0 && player.participation !== 'sitting-out');
+  }
+
+  normalizePresenceAfterRestart(): void {
+    for (const player of this.players) player.connected = false;
+  }
+
+  promoteWaitingPlayers(): boolean {
+    if (this.hand?.status === 'active' || this.preparing) return false;
+    const sequenceBefore = this.eventSequence;
+    this.assignWaitingSeats();
+    return this.eventSequence !== sequenceBefore;
+  }
+
+  nextAuditExpiry(): number | undefined {
+    const expiries = [...this.audits.values()].map((audit) => Date.parse(audit.expiresAt)).filter(Number.isFinite);
+    return expiries.length > 0 ? Math.min(...expiries) : undefined;
+  }
+
+  settlementDeltas(): Array<{ handId: string; playerId: string; amount: number }> {
+    const handId = this.hand?.status === 'settled' ? this.hand.id : undefined;
+    const audit = handId ? this.audits.get(handId) : undefined;
+    if (!audit) return [];
+    return audit.participantIds.map((playerId) => ({
+      handId: audit.handId,
+      playerId,
+      amount: (audit.result.payouts[playerId] ?? 0) - (audit.finalContributions[playerId] ?? 0)
+    }));
+  }
+
+  handHistoryFor(viewerId: string, currentTime = Date.now()) {
+    const isCurrentPlayer = this.players.some((player) => player.id === viewerId);
+    if (!isCurrentPlayer && ![...this.audits.values()].some((audit) => audit.participantIds.includes(viewerId))) throw new Error('无权读取该牌桌手牌记录');
+    return [...this.audits.values()]
+      .filter((audit) => Date.parse(audit.expiresAt) > currentTime && (isCurrentPlayer || audit.participantIds.includes(viewerId)))
+      .sort((a, b) => b.handNumber - a.handNumber)
+      .map((audit) => ({
+        handId: audit.handId,
+        handNumber: audit.handNumber,
+        blinds: { small: audit.smallBlind, big: audit.bigBlind },
+        board: structuredClone(audit.board),
+        participants: audit.participantIds.map((id) => ({ id, nickname: this.players.find((player) => player.id === id)?.nickname ?? '已离桌玩家' })),
+        pointDeltas: Object.fromEntries(audit.participantIds.map((id) => [id, (audit.result.payouts[id] ?? 0) - (audit.finalContributions[id] ?? 0)])),
+        pots: structuredClone(audit.result.pots),
+        settledBy: audit.result.settledBy,
+        settledAt: audit.settledAt,
+        expiresAt: audit.expiresAt
+      }));
+  }
+
+  auditFor(handId: string, viewerId: string, currentTime = Date.now()): HandAudit {
+    if (this.hand?.id === handId && this.hand.status === 'active') throw new Error('手牌尚未结算');
+    const audit = this.audits.get(handId);
+    if (!audit) throw new Error('审计材料不存在或手牌尚未结算');
+    if (!audit.participantIds.includes(viewerId)) throw new Error('仅本手参与者可读取完整审计材料');
+    if (Date.parse(audit.expiresAt) <= currentTime) throw new Error('审计材料已过期');
+    return structuredClone(audit);
+  }
+
+  replayFor(handId: string, viewerId: string, currentTime = Date.now()) {
+    if (this.hand?.id === handId && this.hand.status === 'active') throw new Error('回放不存在或手牌尚未结算');
+    const audit = this.audits.get(handId);
+    if (!audit) throw new Error('回放不存在或手牌尚未结算');
+    if (!audit.participantIds.includes(viewerId) && !this.players.some((player) => player.id === viewerId)) throw new Error('无权读取该手回放');
+    if (Date.parse(audit.expiresAt) <= currentTime) throw new Error('回放已过期');
+    const foldedIds = new Set(audit.events
+      .filter((event) => event.type === 'action' && event.payload.type === 'fold')
+      .map((event) => event.payload.playerId as string));
+    const events = audit.events.map((event) => {
+      const payload = { ...event.payload };
+      delete payload.seed;
+      return { ...event, payload };
+    });
+    return {
+      handId: audit.handId,
+      roomId: audit.roomId,
+      handNumber: audit.handNumber,
+      blinds: { small: audit.smallBlind, big: audit.bigBlind },
+      commitment: audit.commitment,
+      board: structuredClone(audit.board),
+      players: audit.participantIds.map((id) => ({
+        id,
+        nickname: this.players.find((player) => player.id === id)?.nickname ?? '已离桌玩家',
+        pointDelta: (audit.result.payouts[id] ?? 0) - (audit.finalContributions[id] ?? 0),
+        hole: id === viewerId || (audit.result.settledBy === 'showdown' && !foldedIds.has(id))
+          ? structuredClone(audit.holeCards[id])
+          : undefined
+      })),
+      events,
+      result: structuredClone(audit.result),
+      settledAt: audit.settledAt,
+      expiresAt: audit.expiresAt
+    };
+  }
+
+  purgeExpiredAudits(currentTime = Date.now()): number {
+    let deleted = 0;
+    for (const [handId, audit] of this.audits) {
+      if (Date.parse(audit.expiresAt) <= currentTime) {
+        this.audits.delete(handId);
+        const sequences = new Set([
+          ...audit.events.map((event) => event.sequence),
+          ...this.events.filter((event) => event.payload.handId === handId).map((event) => event.sequence)
+        ]);
+        for (let index = this.events.length - 1; index >= 0; index--) {
+          if (sequences.has(this.events[index].sequence)) this.events.splice(index, 1);
+        }
+        for (const [key, result] of this.actionResults) {
+          if (result.handId === handId) this.actionResults.delete(key);
+        }
+        if (this.hand?.id === handId && this.hand.status === 'settled') {
+          this.hand.seed = '';
+          this.hand.deck = [];
+          this.hand.fullDeck = [];
+          this.hand.playerContributions = {};
+          for (const player of this.players) player.hole = [];
+        }
+        deleted++;
+      }
+    }
+    return deleted;
   }
 
   topUp(playerId: string, amount: number): void {
     if (!Number.isSafeInteger(amount) || amount <= 0) throw new Error('积分必须为正整数');
     const player = this.player(playerId);
+    const wasEmpty = player.stack === 0;
     player.stack += amount;
+    if (wasEmpty && player.participation === 'sitting-out') {
+      player.participation = this.hand?.status === 'active' ? 'waiting' : 'seated';
+    }
     this.record('chips_added', { playerId, amount });
   }
 
-  takeAction(playerId: string, action: Action): void {
+  takeAction(
+    playerId: string,
+    action: Action,
+    metadata: { actionId?: string; source?: 'player' | 'timeout' | 'internal'; beforeVersion?: number } = {}
+  ): void {
     const hand = this.activeHand();
     if (hand.currentPlayerId !== playerId) throw new Error('尚未轮到你行动');
     const player = this.player(playerId);
+    const contributionBefore = player.contribution;
     if (player.folded || player.allIn) throw new Error('此玩家不能行动');
     const owed = hand.currentBet - player.bet;
     if (action.type === 'fold') {
@@ -183,23 +620,69 @@ export class PokerTable {
     }
     hand.actedAtBet.set(playerId, hand.currentBet);
     hand.pending.delete(playerId);
-    this.record('action', { playerId, type: action.type, amount: action.amount, street: hand.street });
+    const beforeVersion = metadata.beforeVersion ?? this.eventSequence;
+    this.record('action', {
+      handId: hand.id,
+      playerId,
+      actionId: metadata.actionId ?? `internal:${hand.id}:${beforeVersion}`,
+      source: metadata.source ?? 'internal',
+      beforeVersion,
+      afterVersion: beforeVersion + 1,
+      type: action.type,
+      amount: action.amount,
+      street: hand.street,
+      committedAmount: player.contribution - contributionBefore,
+      contributionAfter: player.contribution,
+      betAfter: player.bet,
+      stackAfter: player.stack,
+      currentBetAfter: hand.currentBet
+    });
     this.progress();
   }
 
-  timeout(playerId: string): void {
+  submitAction(playerId: string, input: unknown): SubmitActionResult {
+    if (!input || typeof input !== 'object') throw new Error('动作请求无效');
+    const command = input as Partial<ActionCommand>;
+    if (typeof command.actionId !== 'string' || command.actionId.length < 1 || command.actionId.length > 128) throw new Error('actionId 无效');
+    const resultKey = `${playerId}:${command.actionId}`;
+    const previous = this.actionResults.get(resultKey);
+    if (previous) {
+      if (previous.handId !== command.handId) throw new Error('actionId 已用于其他手牌');
+      return { accepted: false, sequence: previous.sequence };
+    }
     const hand = this.activeHand();
-    if (hand.currentPlayerId !== playerId) return;
+    if (command.handId !== hand.id) throw new Error('手牌已变化，请同步后重试');
+    if (!Number.isSafeInteger(command.version) || command.version !== this.eventSequence) throw new Error('牌桌状态已变化，请同步后重试');
+    if (!['fold', 'check', 'call', 'bet', 'raise'].includes(command.type ?? '')) throw new Error('动作类型无效');
+    const type = command.type === 'bet' ? 'raise' : command.type as Action['type'];
+    this.takeAction(playerId, type === 'raise' ? { type, amount: command.raiseTo } : { type }, {
+      actionId: command.actionId,
+      source: 'player',
+      beforeVersion: command.version
+    });
+    const result = { handId: hand.id, sequence: this.eventSequence };
+    this.actionResults.set(resultKey, result);
+    return { accepted: true, sequence: result.sequence };
+  }
+
+  timeout(playerId: string): boolean {
+    const hand = this.activeHand();
+    if (hand.currentPlayerId !== playerId) return false;
     const player = this.player(playerId);
-    this.takeAction(playerId, { type: hand.currentBet === player.bet ? 'check' : 'fold' });
+    this.takeAction(playerId, { type: hand.currentBet === player.bet ? 'check' : 'fold' }, {
+      actionId: `timeout:${hand.id}:${this.eventSequence}`,
+      source: 'timeout',
+      beforeVersion: this.eventSequence
+    });
+    return true;
   }
 
   startNextHand(): void {
-    if (!this.hand || this.hand.status === 'settled') this.startHand();
+    if ((!this.hand || this.hand.status === 'settled') && !this.preparing) this.prepareHand();
   }
 
   canStartHand(): boolean {
-    return this.players.filter((player) => player.stack > 0).length >= 2;
+    return this.players.filter((player) => player.stack > 0 && player.connected && player.seat > 0 && player.participation === 'seated').length >= 2;
   }
 
   snapshot(viewerId: string) {
@@ -208,12 +691,19 @@ export class PokerTable {
     return {
       roomId: this.roomId,
       sequence: this.eventSequence,
-      players: this.players.map(({ id, nickname, seat, stack, connected, folded, allIn, bet, contribution, hole }) => ({
-        id, nickname, seat, stack, connected, folded, allIn, bet, contribution,
-        hole: hand && (id === viewerId || (hand.status === 'settled' && hand.settledBy === 'showdown' && !folded)) ? hole : undefined
+      players: this.players.map(({ id, nickname, seat, stack, connected, participation, folded, allIn, bet, contribution, hole }) => ({
+        id, nickname, seat, stack, connected, participation, folded, allIn, bet, contribution,
+        hole: hand && hole.length === 2 && (id === viewerId || (hand.status === 'settled' && hand.settledBy === 'showdown' && !folded)) ? hole : undefined
       })),
+      preparing: this.preparing && {
+        id: this.preparing.id,
+        number: this.preparing.number,
+        commitment: this.preparing.commitment,
+        participantIds: [...this.preparing.participantIds],
+        readyPlayerIds: [...this.preparing.contributions.keys()]
+      },
       hand: hand && {
-        number: hand.number, commitment: hand.commitment, board: hand.board, street: hand.street,
+        id: hand.id, number: hand.number, commitment: hand.commitment, board: hand.board, street: hand.street,
         dealerSeat: hand.dealerSeat, smallBlindSeat: hand.smallBlindSeat, bigBlindSeat: hand.bigBlindSeat,
         currentPlayerId: hand.currentPlayerId, currentBet: hand.currentBet, minRaise: hand.minRaise, status: hand.status,
         potTotal: pots.reduce((sum, pot) => sum + pot.amount, 0), pots, legalActions: this.legalActions(viewerId)
@@ -223,13 +713,29 @@ export class PokerTable {
 
   get recentEvents(): EngineEvent[] { return this.events.slice(-100); }
 
-  private startHand(): void {
-    const ready = this.players.filter((player) => player.stack > 0);
+  private prepareHand(): void {
+    this.assignWaitingSeats();
+    const ready = this.players.filter((player) => player.stack > 0 && player.connected && player.seat > 0 && player.participation === 'seated');
     if (ready.length < 2) return;
+    const id = randomUUID();
+    const { seed, commitment } = serverCommitment();
+    this.preparing = { id, number: this.handNumber + 1, seed, commitment, participantIds: ready.map((player) => player.id), contributions: new Map() };
+    this.record('shuffle_committed', { handId: id, number: this.handNumber + 1, algorithmVersion: SHUFFLE_ALGORITHM_VERSION, commitment, participantIds: ready.map((player) => player.id) });
+  }
+
+  private dealPreparedHand(): void {
+    const preparing = this.preparing;
+    if (!preparing) throw new Error('当前没有准备中的手牌');
+    const ready = preparing.participantIds.map((id) => this.player(id));
     const dealer = nextSeat(ready, this.lastDealerSeat);
     this.lastDealerSeat = dealer.seat;
     for (const player of this.players) Object.assign(player, { folded: false, allIn: false, bet: 0, contribution: 0, hole: [] });
-    const { seed, deck, commitment } = shuffledDeck();
+    const handId = preparing.id;
+    const playerContributions = Object.fromEntries(preparing.contributions);
+    const deck = deterministicDeck(preparing.seed, playerContributions, handId);
+    const seed = preparing.seed;
+    const commitment = preparing.commitment;
+    const fullDeck = structuredClone(deck);
     for (const player of [...ready].sort(bySeat)) player.hole = [deck.pop()!, deck.pop()!];
     const small = ready.length === 2 ? dealer : nextSeat(ready, dealer.seat);
     const big = ready.length === 2 ? nextSeat(ready, dealer.seat) : nextSeat(ready, small.seat);
@@ -242,13 +748,29 @@ export class PokerTable {
         ? dealer
         : nextSeat(actionable, big.seat);
     this.hand = {
-      number: ++this.handNumber, seed, deck, commitment, board: [], street: 'preflop', dealerSeat: dealer.seat,
+      id: handId, number: ++this.handNumber, seed, deck, fullDeck, playerContributions, participantIds: ready.map((player) => player.id),
+      startedEventSequence: this.eventSequence + 1, commitment, board: [], street: 'preflop', dealerSeat: dealer.seat,
       smallBlindSeat: small.seat, bigBlindSeat: big.seat,
       currentPlayerId: first?.id, currentBet: this.bigBlind, minRaise: this.bigBlind,
       pending: new Set(ready.filter((p) => !p.allIn).map((p) => p.id)), actedAtBet: new Map(), status: 'active'
     };
-    this.record('hand_started', { number: this.hand.number, commitment, dealerSeat: dealer.seat, smallBlind: small.id, bigBlind: big.id });
+    this.preparing = undefined;
+    this.record('hand_started', { handId, number: this.hand.number, algorithmVersion: SHUFFLE_ALGORITHM_VERSION, commitment, dealerSeat: dealer.seat, smallBlind: small.id, bigBlind: big.id });
+    this.record('blinds_posted', { handId, smallBlindPlayerId: small.id, smallBlindAmount: Math.min(this.smallBlind, small.contribution), bigBlindPlayerId: big.id, bigBlindAmount: Math.min(this.bigBlind, big.contribution) });
+    this.record('cards_dealt', { handId, participantIds: ready.map((player) => player.id) });
     if (!first) this.advanceStreet();
+  }
+
+  private assignWaitingSeats(): void {
+    const used = new Set(this.players.map((player) => player.seat).filter((seat) => seat > 0));
+    for (const player of this.players.filter((item) => item.participation === 'waiting' && item.stack > 0)) {
+      const seat = Array.from({ length: this.maxSeats }, (_, index) => index + 1).find((value) => !used.has(value));
+      if (!seat) break;
+      player.seat = seat;
+      player.participation = 'seated';
+      used.add(seat);
+      this.record('seat_assigned', { playerId: player.id, seat });
+    }
   }
 
   private progress(): void {
@@ -271,7 +793,7 @@ export class PokerTable {
     hand.minRaise = this.bigBlind;
     const players = this.eligible().filter((player) => !player.allIn);
     hand.actedAtBet = new Map();
-    this.record('street_started', { street: hand.street, board: hand.board });
+    this.record('street_started', { handId: hand.id, street: hand.street, board: hand.board });
     if (players.length <= 1) {
       hand.pending = new Set();
       hand.currentPlayerId = undefined;
@@ -286,8 +808,10 @@ export class PokerTable {
     const hand = this.activeHand();
     const settledBy = contenders.length === 1 ? 'fold' : 'showdown';
     if (settledBy === 'showdown') while (hand.board.length < 5) hand.board.push(hand.deck.pop()!);
+    const contributionsBeforeRefund = Object.fromEntries(hand.participantIds.map((id) => [id, this.player(id).contribution]));
     const refund = this.returnUncalled();
     const pots = this.potBreakdown();
+    const finalContributions = Object.fromEntries(hand.participantIds.map((id) => [id, this.player(id).contribution]));
     const payouts: Record<string, number> = {};
     for (const pot of pots) {
       const eligible = contenders.filter((player) => pot.eligiblePlayerIds.includes(player.id));
@@ -303,12 +827,51 @@ export class PokerTable {
       for (const winner of orderedWinners) payouts[winner.id] = (payouts[winner.id] ?? 0) + share + (remainder-- > 0 ? 1 : 0);
     }
     for (const [id, amount] of Object.entries(payouts)) this.player(id).stack += amount;
+    for (const player of this.players) {
+      if (player.stack === 0) player.participation = 'sitting-out';
+    }
     hand.status = 'settled';
     hand.street = 'showdown';
     hand.currentPlayerId = undefined;
     hand.pending.clear();
     hand.settledBy = settledBy;
-    this.record('hand_settled', { board: hand.board, pots, refund, payouts, settledBy, seed: hand.seed, commitment: hand.commitment });
+    if (refund) this.record('uncalled_returned', { handId: hand.id, ...refund });
+    this.record('pots_built', { handId: hand.id, pots });
+    for (const [playerId, amount] of Object.entries(payouts)) this.record('payout_awarded', { handId: hand.id, playerId, amount });
+    this.record('hand_settled', { handId: hand.id, board: hand.board, pots, refund, payouts, settledBy, commitment: hand.commitment });
+    const settledAt = new Date().toISOString();
+    const dealOrder = [...hand.participantIds].sort((a, b) => this.player(a).seat - this.player(b).seat);
+    this.audits.set(hand.id, {
+      handId: hand.id,
+      roomId: this.roomId,
+      handNumber: hand.number,
+      algorithmVersion: SHUFFLE_ALGORITHM_VERSION,
+      serverSeed: hand.seed,
+      commitment: hand.commitment,
+      playerContributions: structuredClone(hand.playerContributions),
+      participantIds: [...hand.participantIds],
+      dealOrder,
+      seatByPlayerId: Object.fromEntries(hand.participantIds.map((id) => [id, this.player(id).seat])),
+      dealerSeat: hand.dealerSeat,
+      maxSeats: this.maxSeats,
+      smallBlind: this.smallBlind,
+      bigBlind: this.bigBlind,
+      foldedPlayerIds: hand.participantIds.filter((id) => this.player(id).folded),
+      contributionsBeforeRefund,
+      finalContributions,
+      deck: structuredClone(hand.fullDeck),
+      holeCards: Object.fromEntries(hand.participantIds.map((id) => [id, structuredClone(this.player(id).hole)])),
+      board: structuredClone(hand.board),
+      events: structuredClone(this.events.filter((event) => event.payload.handId === hand.id)),
+      result: { pots: structuredClone(pots), refund: structuredClone(refund), payouts: structuredClone(payouts), settledBy },
+      settledAt,
+      expiresAt: new Date(Date.now() + TEN_DAYS_MS).toISOString()
+    });
+    if (this.events.length > 500) this.events.splice(0, this.events.length - 500);
+    hand.seed = '';
+    hand.deck = [];
+    hand.fullDeck = [];
+    hand.playerContributions = {};
   }
 
   private legalActions(playerId: string): LegalActions | undefined {
