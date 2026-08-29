@@ -1,0 +1,24 @@
+{
+  "name": "river-table",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "dev:api": "npm run dev -w @river/api",
+    "dev:web": "npm run dev -w @river/web",
+    "build": "npm run build -w @river/web && npm run build -w @river/api",
+    "test": "npm run test:unit && npm run test:e2e",
+    "test:unit": "npm run test -w @river/web && npm run test -w @river/api",
+    "test:coverage": "npm run test:coverage -w @river/web && npm run test:coverage -w @river/api",
+    "test:e2e": "playwright test",
+    "typecheck": "tsc --noEmit -p apps/api/tsconfig.json && tsc --noEmit -p apps/web/tsconfig.json"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.62.1",
+    "typescript": "^5.7.3"
+  }
+}
