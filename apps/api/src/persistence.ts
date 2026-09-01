@@ -832,7 +832,7 @@ export class PostgresTableRepository {
            'amount', amount, 'reason', reason, 'idempotencyKey', idempotency_key,
            'createdAt', created_at, 'ordinal', ordinal
          )::text as hash_material
-       from chip_ledger_entries where ordinal <= $1 order by ordinal`,
+       from chip_ledger_entries where ordinal <= $1 order by chip_ledger_entries.ordinal`,
       [ledgerCursor]
     );
     let ledgerHash = '';
@@ -859,7 +859,7 @@ export class PostgresTableRepository {
            'roomId', room_id, 'playerId', player_id, 'finalChips', final_chips,
            'createdAt', created_at, 'ordinal', ordinal
          )::text as hash_material
-       from room_settlements where ordinal <= $1 order by ordinal`,
+       from room_settlements where ordinal <= $1 order by room_settlements.ordinal`,
       [settlementCursor]
     );
     let settlementHash = '';

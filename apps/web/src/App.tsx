@@ -1,9 +1,12 @@
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { io, type Socket } from 'socket.io-client';
-import { api, type HandHistoryItem, type HandReplay, type LedgerEntry, type Member, type Player, type Room, type RoomView } from './api';
+import { api, subscribeSessionExpired, type HandHistoryItem, type HandReplay, type LedgerEntry, type Member, type Player, type Room, type RoomView } from './api';
 import { subscribeTableAudio, tableAudio } from './audio';
+import { copyText } from './clipboard';
+import { bindTableSession, type TableSession, type TableSessionSocket } from './table-session';
 import { tableSoundEvents } from './table-sound-events';
 import { inviteCodeFromPath } from './invite-route';
+import { buildReplayStages, describeReplayMoment, type ReplayCard } from './hand-replay';
 import { participantStatus, seatLayout } from './table-view';
 
 type NoticeTone = 'success' | 'error';
@@ -62,12 +65,12 @@ const cardSuit = (suit: string) => ({ S: '♠', H: '♥', D: '♦', C: '♣' }[s
 const format = (value: number) => new Intl.NumberFormat('zh-CN').format(value);
 const randomContribution = () => Array.from(crypto.getRandomValues(new Uint8Array(16)), (value) => value.toString(16).padStart(2, '0')).join('');
 
-function Icon({ name, size = 20 }: { name: 'plus' | 'lock' | 'settings' | 'arrow' | 'users' | 'copy' | 'close' | 'history' | 'sound' | 'soundOff' | 'back' | 'more' | 'refresh'; size?: number }) {
+function Icon({ name, size = 20 }: { name: 'plus' | 'lock' | 'settings' | 'arrow' | 'users' | 'copy' | 'link' | 'close' | 'history' | 'sound' | 'soundOff' | 'back' | 'more' | 'refresh'; size?: number }) {
   const paths = {
     plus: <><path d="M12 5v14M5 12h14" /></>, lock: <><rect x="5" y="10" width="14" height="10" rx="2" /><path d="M8 10V7a4 4 0 0 1 8 0v3" /></>,
     settings: <><circle cx="12" cy="12" r="3" /><path d="M12 2v3m0 14v3M2 12h3m14 0h3M4.9 4.9 7 7m10 10 2.1 2.1M19.1 4.9 17 7M7 17l-2.1 2.1" /></>,
     arrow: <path d="m9 18 6-6-6-6" />, users: <><circle cx="9" cy="8" r="3" /><path d="M3.5 20c.6-3.2 2.5-5 5.5-5s4.9 1.8 5.5 5M17 11a3 3 0 1 0-1-5.8M16.5 15.1c2.3.3 3.7 1.9 4 4.9" /></>,
-    copy: <><rect x="8" y="8" width="11" height="11" rx="2" /><path d="M5 15H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v1" /></>, close: <path d="m6 6 12 12M18 6 6 18" />,
+    copy: <><rect x="8" y="8" width="11" height="11" rx="2" /><path d="M5 15H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v1" /></>, link: <><path d="M10 13a5 5 0 0 0 7.1.1l2-2a5 5 0 0 0-7.1-7.1l-1.1 1.1" /><path d="M14 11a5 5 0 0 0-7.1-.1l-2 2A5 5 0 0 0 12 20l1.1-1.1" /></>, close: <path d="m6 6 12 12M18 6 6 18" />,
     history: <><path d="M3 12a9 9 0 1 0 3-6.7" /><path d="M3 4v5h5M12 7v5l3 2" /></>, sound: <><path d="M4 10v4h4l5 4V6l-5 4zM17 9a4 4 0 0 1 0 6M19.5 6.5a7 7 0 0 1 0 11" /></>, soundOff: <><path d="M4 10v4h4l5 4V6l-5 4zM16 10l5 5m0-5-5 5" /></>,
     back: <path d="m15 18-6-6 6-6" />, more: <path d="M5 12h.01M12 12h.01M19 12h.01" />,
     refresh: <><path d="M20 6v5h-5" /><path d="M4 18v-5h5" /><path d="M6.1 9a7 7 0 0 1 11.5-2.6L20 9M4 15l2.4 2.6A7 7 0 0 0 17.9 15" /></>
@@ -78,6 +81,63 @@ function Icon({ name, size = 20 }: { name: 'plus' | 'lock' | 'settings' | 'arrow
 function Sheet({ title, onClose, children }: { title: string; onClose: () => void; children: React.ReactNode }) {
   useEffect(() => { const handler = (event: KeyboardEvent) => event.key === 'Escape' && onClose(); addEventListener('keydown', handler); return () => removeEventListener('keydown', handler); }, [onClose]);
   return <div className="scrim" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}><section className="sheet" role="dialog" aria-modal="true" aria-labelledby="sheet-title"><header className="sheetHeader"><h2 id="sheet-title">{title}</h2><button className="iconButton" onClick={onClose} aria-label="关闭"><Icon name="close" /></button></header>{children}</section></div>;
+}
+
+function ReplayCards({ cards, compact = false, emptyText }: { cards: ReplayCard[]; compact?: boolean; emptyText?: string }) {
+  if (!cards.length) return emptyText ? <span className="replayCardsEmpty">{emptyText}</span> : null;
+  return <span className={`replayCards ${compact ? 'compact' : ''}`} aria-label={cards.map((card) => `${cardRank(card.rank)}${cardSuit(card.suit)}`).join(' ')}>{cards.map((card, index) => <span key={`${card.rank}-${card.suit}-${index}`} className={`replayCard ${card.suit === 'H' || card.suit === 'D' ? 'red' : ''}`}><b>{cardRank(card.rank)}</b><i>{cardSuit(card.suit)}</i></span>)}</span>;
+}
+
+function HandReplayDetail({ replay, onBack, onDownload }: { replay: HandReplay; onBack: () => void; onDownload: (handId: string) => void }) {
+  const playerNames = useMemo(() => new Map(replay.players.map((item) => [item.id, item.nickname])), [replay.players]);
+  const stages = useMemo(() => buildReplayStages(replay), [replay]);
+  const totalPot = replay.result.pots.reduce((sum, pot) => sum + pot.amount, 0);
+  const payouts = Object.entries(replay.result.payouts).filter(([, amount]) => amount > 0).sort(([, first], [, second]) => second - first);
+  const winners = payouts.map(([id]) => playerNames.get(id) ?? '未知玩家');
+  const sortedPlayers = [...replay.players].sort((first, second) => second.pointDelta - first.pointDelta);
+  const playerName = (id?: string) => id ? playerNames.get(id) ?? '未知玩家' : '未知玩家';
+  const resultText = replay.result.settledBy === 'showdown'
+    ? `${winners.join('、') || '获胜玩家'} 摊牌胜出`
+    : `${winners.join('、') || '获胜玩家'} 收下底池`;
+
+  return <article className="replayDetail">
+    <button className="replayBack" onClick={onBack}><Icon name="back" size={18} /> 返回手牌列表</button>
+    <header className="replayHeading">
+      <div><span className="replayEyebrow">HAND #{replay.handNumber}</span><h3>第 {replay.handNumber} 手回放</h3><p>{new Date(replay.settledAt).toLocaleString('zh-CN')} · 盲注 {format(replay.blinds.small)} / {format(replay.blinds.big)}</p></div>
+      <span className={`replayResultBadge ${replay.result.settledBy}`}>{replay.result.settledBy === 'showdown' ? '摊牌' : '弃牌结束'}</span>
+    </header>
+
+    <section className="replayHero" aria-label="本手结果摘要">
+      <div className="replayHeroPot"><span>总底池</span><strong>{format(totalPot)}</strong><small>{replay.result.pots.length > 1 ? `${replay.result.pots.length - 1} 个边池` : '单一底池'}</small></div>
+      <div className="replayHeroResult"><strong>{resultText}</strong><ReplayCards cards={replay.board} emptyText="未发公共牌" /></div>
+    </section>
+
+    <section className="replaySection" aria-labelledby="replay-player-results">
+      <header className="replaySectionHeader"><div><h4 id="replay-player-results">玩家结果</h4><p>按本手积分变化排序</p></div></header>
+      <div className="replayPlayerList">{sortedPlayers.map((replayPlayer) => <div className="replayPlayerRow" key={replayPlayer.id}>
+        <span className="replayAvatar">{replayPlayer.nickname.slice(0, 1)}</span>
+        <div className="replayPlayerIdentity"><strong>{replayPlayer.nickname}</strong>{replayPlayer.hole ? <ReplayCards cards={replayPlayer.hole} compact /> : <small>手牌未公开</small>}</div>
+        <strong className={`replayDelta ${replayPlayer.pointDelta > 0 ? 'positive' : replayPlayer.pointDelta < 0 ? 'negative' : 'even'}`}>{replayPlayer.pointDelta > 0 ? '+' : ''}{format(replayPlayer.pointDelta)}</strong>
+      </div>)}</div>
+      {replay.result.pots.length > 1 && <div className="replayPots">{replay.result.pots.map((pot, index) => <span key={index}><small>{index === 0 ? '主池' : `边池 ${index}`}</small><b>{format(pot.amount)}</b></span>)}</div>}
+    </section>
+
+    <section className="replaySection" aria-labelledby="replay-action-timeline">
+      <header className="replaySectionHeader"><div><h4 id="replay-action-timeline">行动过程</h4><p>从盲注到派奖，按牌局顺序还原</p></div></header>
+      <div className="replayStreetList">{stages.map((stage, stageIndex) => <section className="replayStreet" key={stage.id}>
+        <header className="replayStreetHeader"><span>{stageIndex + 1}</span><div><h5>{stage.label}</h5>{stage.board.length > 0 && <ReplayCards cards={stage.board} compact />}</div></header>
+        <div className="replayMoments">{stage.moments.length ? stage.moments.map((moment) => {
+          const description = describeReplayMoment(moment, playerName, format);
+          return <div className={`replayMoment ${description.tone}`} key={moment.sequence}><span className="replayMomentDot" /><div><strong>{description.title}</strong>{description.detail && <small>{description.detail}</small>}</div></div>;
+        }) : <p className="replayNoAction">无需继续行动，公共牌自动发出</p>}</div>
+      </section>)}</div>
+    </section>
+
+    <details className="auditDetails">
+      <summary><span><strong>审计与技术详情</strong><small>事件编号、系统事件和原始数据</small></span><Icon name="arrow" size={17} /></summary>
+      <div className="auditDetailsBody"><p>仅在核验牌局时需要查看；普通回放无需阅读这些数据。</p><button className="secondary small auditDownload" onClick={() => onDownload(replay.handId)}>下载完整审计材料</button><ol>{replay.events.map((event) => <li key={event.sequence}><strong>#{event.sequence} {event.type}</strong><code>{JSON.stringify(event.payload)}</code></li>)}</ol></div>
+    </details>
+  </article>;
 }
 
 function GuestGate({ onCreated }: { onCreated: (player: Player) => void }) {
@@ -94,6 +154,13 @@ export function App() {
   const notify = useCallback((tone: NoticeTone, text: string) => { setNotice({ tone, text }); setTimeout(() => setNotice(null), 3200); }, []);
   const refreshRooms = async () => { try { setRooms((await api.rooms()).rooms); } catch (reason) { if ((reason as Error).message.includes('游客')) setPlayer(null); else notify('error', (reason as Error).message); } };
   useEffect(() => { api.me().then(({ player }) => { setPlayer(player); if (player) void refreshRooms(); }).catch(() => setPlayer(null)); }, []);
+  useEffect(() => subscribeSessionExpired(() => {
+    setPlayer(null);
+    setRooms([]);
+    setSelectedRoom(null);
+    setTableOpen(false);
+    setSheet(null);
+  }), []);
   const refreshRoom = async (id: string) => { setSelectedRoom((await api.room(id)).room); };
   const openRoom = async (id: string) => { try { setTableOpen(false); await refreshRoom(id); } catch (reason) { notify('error', (reason as Error).message); } };
   if (player === undefined) return <div className="loading">正在连接 River Table…</div>;
@@ -144,8 +211,8 @@ function RoomScreen({ player, room, onBack, onRefresh, onTableChange, notify }: 
   useEffect(() => { api.ledger(room.id).then((result) => setLedger(result.entries)).catch(() => undefined); }, [room.id]);
 
   const copy = async (value: string, label: string) => {
-    try { await navigator.clipboard.writeText(value); notify('success', `${label}已复制`); }
-    catch { notify('error', '当前浏览器不支持复制'); }
+    const copied = await copyText(value);
+    notify(copied ? 'success' : 'error', copied ? `${label}已复制` : '当前浏览器不支持复制');
   };
   const syncRoomData = async () => {
     const [, ledgerResult] = await Promise.all([onRefresh(), api.ledger(room.id)]);
@@ -251,8 +318,8 @@ function RoomScreen({ player, room, onBack, onRefresh, onTableChange, notify }: 
       <div><p className="eyebrow">{room.isHost ? 'ROOM ADMIN' : 'INVITED PLAYER'}</p><h1>{room.name}</h1><p>{room.smallBlind} / {room.bigBlind} · {room.maxSeats} 人桌</p></div>
     </header>
     {room.isHost && <section className="inviteCard">
-      <div><p className="eyebrow">仅受邀玩家可进入</p><strong>{room.inviteCode}</strong><p>{room.inviteOpen ? '邀请码有效，可分享给熟悉的好友' : '邀请已关闭'}</p></div>
-      <div className="inviteActions"><button className="iconButton" aria-label="复制邀请码" onClick={() => copy(room.inviteCode, '邀请码')}><Icon name="copy" /></button><button className="secondary small" onClick={() => copy(`${location.origin}/join/${room.inviteCode}`, '邀请链接')}>复制链接</button></div>
+      <div className="inviteDetails"><p className="eyebrow">仅受邀玩家可进入</p><strong className="inviteCode">{room.inviteCode}</strong><p>{room.inviteOpen ? '邀请码有效，可分享给熟悉的好友' : '邀请已关闭'}</p></div>
+      <div className="inviteActions"><button type="button" className="secondary small" onClick={() => copy(room.inviteCode, '邀请码')}><Icon name="copy" />复制邀请码</button><button type="button" className="secondary small" onClick={() => copy(`${location.origin}/join/${room.inviteCode}`, '邀请链接')}><Icon name="link" />复制链接</button></div>
     </section>}
     <div className="roomButtons">
       <button className="primary" disabled={['closing', 'dissolved'].includes(room.status)} onClick={() => { tableAudio.enterTable(); setScreen('table'); }}>进入牌桌 <Icon name="arrow" /></button>
@@ -336,11 +403,12 @@ function NextHandClock({ timing }: { timing: TableSnapshot['timing'] }) {
   return <div className="nextHandClock" role="timer" aria-live="polite" data-phase="next-hand"><span>本手已结算 · 下一手</span><strong>{seconds ?? '…'}</strong><small>秒</small></div>;
 }
 
-function BetControls({ hand, legal, me, mine, onAction }: {
+function BetControls({ hand, legal, me, mine, playerNickname, onAction }: {
   hand?: HandSnapshot;
   legal?: LegalActions;
   me?: TableSnapshot['players'][number];
   mine: boolean;
+  playerNickname: string;
   onAction: (type: TableActionType, amount?: number) => void;
 }) {
   const options = hand && legal ? quickBetOptions(hand, legal, me?.bet ?? 0) : [];
@@ -356,6 +424,10 @@ function BetControls({ hand, legal, me, mine, onAction }: {
   const openingBet = (hand?.currentBet ?? 0) === 0;
 
   return <section className="actionDock">
+    <div className="actionPlayerInfo" aria-label={`当前玩家 ${me?.nickname ?? playerNickname}，筹码 ${format(me?.stack ?? 0)}`}>
+      <span className="actionPlayerName" title={me?.nickname ?? playerNickname}>{me?.nickname ?? playerNickname}</span>
+      <span className="actionPlayerStack"><span>筹码</span><strong>{format(me?.stack ?? 0)}</strong></span>
+    </div>
     <div className="commitment"><span>{mine ? `待跟 ${format(legal?.toCall ?? 0)}` : '牌序承诺'}</span><code>{mine ? `本轮已投入 ${format(me?.bet ?? 0)}` : hand?.commitment?.slice(0, 12) ?? '等待发牌'}</code></div>
     {!mine || !hand || !legal?.canRaise ? <div className="betSizingIdle">轮到你时显示快捷下注码量</div> : customMode ? <div className="customBetPanel">
       <div className="customBetHeader"><button type="button" onClick={() => setCustomMode(false)} aria-label="返回快捷码量">快捷码量</button><output aria-live="polite">{openingBet ? '下注到' : '加注到'} <b>{format(raiseTarget)}</b></output></div>
@@ -367,12 +439,13 @@ function BetControls({ hand, legal, me, mine, onAction }: {
 }
 
 function TableScreen({ room, player, onBack, notify }: { room: RoomView; player: Player; onBack: () => void; notify: (tone: 'success' | 'error', text: string) => void }) {
-  const [snapshot, setSnapshot] = useState<TableSnapshot | null>(null); const [starting, setStarting] = useState(false); const [auditStatus, setAuditStatus] = useState<string>(); const [handHistory, setHandHistory] = useState<HandHistoryItem[] | null>(null); const [selectedReplay, setSelectedReplay] = useState<HandReplay | null>(null); const socketRef = useRef<Socket | null>(null);
+  const [snapshot, setSnapshot] = useState<TableSnapshot | null>(null); const [starting, setStarting] = useState(false); const [auditStatus, setAuditStatus] = useState<string>(); const [handHistory, setHandHistory] = useState<HandHistoryItem[] | null>(null); const [selectedReplay, setSelectedReplay] = useState<HandReplay | null>(null); const [replayLoadingId, setReplayLoadingId] = useState<string>(); const socketRef = useRef<Socket | null>(null);
+  const tableSessionRef = useRef<TableSession | null>(null);
   const previousSnapshot = useRef<TableSnapshot | null>(null);
   const contributedHands = useRef(new Set<string>());
   const audioEnabled = useSyncExternalStore(subscribeTableAudio, tableAudio.getEnabled, tableAudio.getEnabled);
   useEffect(() => { tableAudio.enterTable(); return () => tableAudio.leaveTable(); }, []);
-  useEffect(() => { const socket = io({ path: '/socket.io', transports: ['websocket'] }); socketRef.current = socket; const acceptSnapshot = (next: TableSnapshot) => {
+  useEffect(() => { const socket = io({ path: '/socket.io', transports: ['websocket'], autoConnect: false }); socketRef.current = socket; const acceptSnapshot = (next: TableSnapshot) => {
     const previous = previousSnapshot.current; const previousHand = previous?.hand; const nextHand = next.hand;
     if (previous && nextHand) {
       for (const cue of tableSoundEvents(previous, next, player.id)) tableAudio.play(cue);
@@ -390,10 +463,12 @@ function TableScreen({ room, player, onBack, notify }: { room: RoomView; player:
     }
     previousSnapshot.current = next;
     setSnapshot(next);
-  }; void api.table(room.id, previousSnapshot.current?.sequence).then((result) => acceptSnapshot(result.snapshot as TableSnapshot)).catch(() => undefined); socket.on('connect', () => socket.emit('table:join', { roomId: room.id }, (response: { ok: boolean; error?: string }) => {
-    if (!response.ok) notify('error', response.error ?? '无法进入牌桌');
-    else void api.table(room.id, previousSnapshot.current?.sequence).then((result) => acceptSnapshot(result.snapshot as TableSnapshot)).catch((reason) => notify('error', (reason as Error).message));
-  })); socket.on('table:snapshot', acceptSnapshot); socket.on('table:revoked', () => { notify('error', '你已不再是该房间成员'); onBack(); }); return () => { socket.disconnect(); }; }, [room.id, player.id, notify]);
+  }; const refreshSnapshot = () => api.table(room.id, previousSnapshot.current?.sequence).then((result) => acceptSnapshot(result.snapshot as TableSnapshot)); const tableSession = bindTableSession({
+    socket: socket as unknown as TableSessionSocket,
+    roomId: room.id,
+    refreshSnapshot,
+    onJoinError: (message) => notify('error', message)
+  }); tableSessionRef.current = tableSession; socket.on('table:snapshot', acceptSnapshot); socket.on('table:revoked', () => { notify('error', '你已不再是该房间成员'); onBack(); }); void refreshSnapshot().catch(() => undefined); socket.connect(); return () => { tableSession.dispose(); if (tableSessionRef.current === tableSession) tableSessionRef.current = null; socket.disconnect(); }; }, [room.id, player.id, notify]);
   const me = snapshot?.players.find((item) => item.id === player.id); const hand = snapshot?.hand; const legal = hand?.legalActions; const mine = hand?.currentPlayerId === player.id && !!legal;
   const act = (type: TableActionType, amount?: number) => {
     if (!hand) return;
@@ -403,7 +478,15 @@ function TableScreen({ room, player, onBack, notify }: { room: RoomView; player:
       version: snapshot?.sequence,
       type,
       ...(type === 'raise' ? { raiseTo: amount } : {})
-    }, (response: { ok: boolean; error?: string }) => !response.ok && notify('error', response.error ?? '操作未执行'));
+    }, (response: { ok: boolean; error?: string }) => {
+      if (response.ok) return;
+      if (response.error === '尚未进入牌桌') {
+        tableSessionRef.current?.recover();
+        notify('error', '牌桌连接已恢复，请根据最新牌面重试');
+        return;
+      }
+      notify('error', response.error ?? '操作未执行');
+    });
   };
   const heroSeat = me?.seat ?? 1;
   const waitingCount = snapshot?.players.filter((item) => item.seat === 0 && item.participation === 'waiting').length ?? 0;
@@ -440,8 +523,10 @@ function TableScreen({ room, player, onBack, notify }: { room: RoomView; player:
     catch (reason) { notify('error', (reason as Error).message); }
   };
   const openReplay = async (handId: string) => {
+    setReplayLoadingId(handId);
     try { setSelectedReplay((await api.replay(room.id, handId)).replay); }
     catch (reason) { notify('error', (reason as Error).message); }
+    finally { setReplayLoadingId(undefined); }
   };
   const downloadAudit = async (handId: string) => {
     try {
@@ -468,8 +553,17 @@ function TableScreen({ room, player, onBack, notify }: { room: RoomView; player:
       {me?.hole && <div className="holeCards" aria-label="你的手牌">{me.hole.map((card, index) => <div key={index} className={`playingCard personal ${card.suit === 'H' || card.suit === 'D' ? 'red' : ''}`}><span>{cardRank(card.rank)}</span><b>{cardSuit(card.suit)}</b></div>)}</div>}
       {!hand && <div className="waiting"><Icon name="users" size={26} /><strong>{snapshot?.preparing ? '正在收集本手随机贡献' : canStart ? '牌桌已就绪' : '等待至少一位受邀好友入桌'}</strong><p>{snapshot?.preparing ? `服务端已提交洗牌承诺，等待 ${snapshot.preparing.participantIds.length - snapshot.preparing.readyPlayerIds.length} 位玩家完成贡献。` : canStart ? `已有 ${readyPlayerCount} 位有积分玩家入桌，请由房主开始第一手。` : '至少两位有积分的受邀玩家入桌后，房主即可开始牌局。'}</p>{room.isHost && <button className="primary tableStartButton" disabled={!canStart || starting} onClick={startHand}>{starting ? '正在开始…' : '开始第一手'} <Icon name="arrow" /></button>}</div>}
     </div>
-    <BetControls key={`${hand?.number ?? 0}:${hand?.street ?? 'waiting'}:${hand?.currentPlayerId ?? 'none'}:${hand?.currentBet ?? 0}:${me?.bet ?? 0}`} hand={hand} legal={legal} me={me} mine={mine} onAction={act} />
-    {handHistory && <Sheet title="最近 10 天手牌" onClose={() => { setHandHistory(null); setSelectedReplay(null); }}><div className="historyList">{handHistory.length ? handHistory.map((item) => <button className="historyRow handHistoryRow" key={item.handId} onClick={() => void openReplay(item.handId)}><span className="ledgerGlyph"><Icon name="history" /></span><div><strong>第 {item.handNumber} 手 · {item.settledBy === 'showdown' ? '摊牌' : '弃牌结束'}</strong><small>{new Date(item.settledAt).toLocaleString('zh-CN')} · {item.participants.map((participant) => `${participant.nickname} ${item.pointDeltas[participant.id] >= 0 ? '+' : ''}${item.pointDeltas[participant.id]}`).join(' / ')}</small></div><b>{item.pots.reduce((sum, pot) => sum + pot.amount, 0)}</b></button>) : <div className="emptyState compactEmpty"><Icon name="history" size={28} /><h3>暂无手牌记录</h3><p>结算后的手牌会在这里保留 10 天。</p></div>}</div>{selectedReplay && <article className="replayDetail"><h3>第 {selectedReplay.handNumber} 手回放</h3><p>盲注：{selectedReplay.blinds.small} / {selectedReplay.blinds.big}</p><p>公共牌：{selectedReplay.board.length ? selectedReplay.board.map((card) => `${cardRank(card.rank)}${cardSuit(card.suit)}`).join(' ') : '无'}</p><button className="secondary small" onClick={() => void downloadAudit(selectedReplay.handId)}>下载完整审计材料</button><h4>结果与积分变化</h4>{selectedReplay.players.map((replayPlayer) => <p key={replayPlayer.id}>{replayPlayer.nickname}：{replayPlayer.pointDelta >= 0 ? '+' : ''}{replayPlayer.pointDelta}{replayPlayer.hole ? ` · ${replayPlayer.hole.map((card) => `${cardRank(card.rank)}${cardSuit(card.suit)}`).join(' ')}` : ''}</p>)}<p>{selectedReplay.result.pots.map((pot, index) => `${index === 0 ? '主池' : `边池 ${index}`} ${pot.amount}`).join(' · ')}</p><h4>动作时间线</h4><ol className="replayTimeline">{selectedReplay.events.map((event) => <li key={event.sequence}><b>#{event.sequence} {event.type}</b><span>{JSON.stringify(event.payload)}</span></li>)}</ol></article>}</Sheet>}
+    <BetControls key={`${hand?.number ?? 0}:${hand?.street ?? 'waiting'}:${hand?.currentPlayerId ?? 'none'}:${hand?.currentBet ?? 0}:${me?.bet ?? 0}`} hand={hand} legal={legal} me={me} mine={mine} playerNickname={player.nickname} onAction={act} />
+    {handHistory && <Sheet title={selectedReplay ? '手牌回放' : '最近 10 天手牌'} onClose={() => { setHandHistory(null); setSelectedReplay(null); setReplayLoadingId(undefined); }}>{selectedReplay ? <HandReplayDetail replay={selectedReplay} onBack={() => setSelectedReplay(null)} onDownload={(handId) => void downloadAudit(handId)} /> : <div className="historyList handHistoryList">{handHistory.length ? handHistory.map((item) => {
+      const myDelta = item.pointDeltas[player.id] ?? 0;
+      const potTotal = item.pots.reduce((sum, pot) => sum + pot.amount, 0);
+      const loading = replayLoadingId === item.handId;
+      return <button className="handHistoryRow" key={item.handId} disabled={!!replayLoadingId} onClick={() => void openReplay(item.handId)} aria-label={`查看第 ${item.handNumber} 手牌回放`}>
+        <span className="ledgerGlyph"><Icon name="history" /></span>
+        <span className="handHistoryMain"><span><strong>第 {item.handNumber} 手</strong><i className={item.settledBy}>{item.settledBy === 'showdown' ? '摊牌' : '弃牌结束'}</i></span><small>{new Date(item.settledAt).toLocaleString('zh-CN')} · {item.participants.length} 位玩家</small><ReplayCards cards={item.board} compact emptyText="未发公共牌" /></span>
+        <span className="handHistoryOutcome"><strong className={myDelta > 0 ? 'positive' : myDelta < 0 ? 'negative' : 'even'}>{myDelta > 0 ? '+' : ''}{format(myDelta)}</strong><small>{loading ? '正在加载…' : '我的盈亏'}</small><b>底池 {format(potTotal)}</b></span>
+      </button>;
+    }) : <div className="emptyState compactEmpty"><Icon name="history" size={28} /><h3>暂无手牌记录</h3><p>结算后的手牌会在这里保留 10 天。</p></div>}</div>}</Sheet>}
   </div>;
 }
 

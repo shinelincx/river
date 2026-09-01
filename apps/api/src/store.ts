@@ -23,7 +23,11 @@ export type SerializedRiverStore = {
 };
 
 const now = () => new Date().toISOString();
-const inviteCode = () => `RIVER-${randomBytes(16).toString('base64url').toUpperCase()}`;
+const INVITE_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+const inviteCode = () => {
+  const symbols = [...randomBytes(12)].map((value) => INVITE_CODE_ALPHABET[value & 31]).join('');
+  return `RIVER-${symbols.slice(0, 4)}-${symbols.slice(4, 8)}-${symbols.slice(8)}`;
+};
 const inviteHash = (code: string) => createHash('sha256').update(code.trim().toUpperCase()).digest('hex');
 
 export class RiverStore {

@@ -11,6 +11,17 @@ function completePreparation(table: PokerTable): void {
 }
 
 describe('room permissions and append-only ledger', () => {
+  it('creates compact readable invite codes without reducing them below 60 bits of entropy', () => {
+    const store = new RiverStore();
+    const host = store.createGuest('Host').player;
+    const room = store.createRoom(host.id, { name: 'Compact invite', maxSeats: 6, smallBlind: 10, initialChips: 500 });
+    const guest = store.createGuest('Guest').player;
+
+    expect(room.inviteCode).toMatch(/^RIVER-[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}$/);
+    expect(room.inviteCode).toHaveLength(20);
+    expect(() => store.joinByCode(guest.id, room.inviteCode)).not.toThrow();
+  });
+
   it('rejects unsupported seat counts and blind structures at runtime', () => {
     const store = new RiverStore();
     const host = store.createGuest('Host').player;

@@ -9,8 +9,8 @@ type ClientSocket = ReturnType<typeof io>;
 type TableSnapshot = {
   sequence: number;
   players: Array<{ id: string; hole?: unknown[] }>;
-  preparing?: { id: string; participantIds: string[] };
-  hand?: { id: string; status: string; currentPlayerId?: string };
+  preparing?: { id: string; number?: number; participantIds: string[] };
+  hand?: { id: string; number?: number; status: string; currentPlayerId?: string };
   timing?: { actionDeadlineAt?: number };
 };
 
@@ -69,6 +69,19 @@ async function startWithContributions(hostSocket: ClientSocket, guestSocket: Cli
 }
 
 describe('Socket table API', () => {
+  it('rejects an unauthenticated Socket handshake before a table room can be joined', async () => {
+    const { app } = await buildServer();
+    servers.push(app);
+    const baseUrl = await app.listen({ port: 0, host: '127.0.0.1' });
+    const socket = io(baseUrl, { transports: ['websocket'], reconnection: false });
+    sockets.push(socket);
+
+    const message = await new Promise<string>((resolve) => socket.once('connect_error', (error) => resolve(error.message)));
+
+    expect(message).toBe('未登录');
+    expect(socket.connected).toBe(false);
+  });
+
   it('authenticates the Cookie session and sends each player a private table snapshot', async () => {
     const { app } = await buildServer();
     servers.push(app);
@@ -196,6 +209,41 @@ describe('Socket table API', () => {
     secondHostTab.disconnect();
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(store.tables.get(room.id)?.players.find((player) => player.id === host.id)?.connected).toBe(true);
+  });
+
+  it('broadcasts and deals the next hand without another host start command', async () => {
+    const { app } = await buildServer();
+    servers.push(app);
+    const baseUrl = await app.listen({ port: 0, host: '127.0.0.1' });
+    const hostResponse = await app.inject({ method: 'POST', url: '/api/guests', payload: { nickname: 'Host' } });
+    const hostCookie = hostResponse.headers['set-cookie'] as string;
+    const host = hostResponse.json().player as { id: string };
+    const roomResponse = await app.inject({ method: 'POST', url: '/api/rooms', headers: { cookie: hostCookie }, payload: { name: 'Continuous room', maxSeats: 6, smallBlind: 10, initialChips: 500 } });
+    const room = roomResponse.json().room as { id: string; inviteCode: string };
+    const guestResponse = await app.inject({ method: 'POST', url: '/api/guests', payload: { nickname: 'Guest' } });
+    const guestCookie = guestResponse.headers['set-cookie'] as string;
+    const guest = guestResponse.json().player as { id: string };
+    await app.inject({ method: 'POST', url: `/api/invites/${room.inviteCode}/join`, headers: { cookie: guestCookie } });
+    await app.inject({ method: 'POST', url: `/api/rooms/${room.id}/credits`, headers: { cookie: hostCookie, 'idempotency-key': 'continuous-guest-credit' }, payload: { playerId: guest.id, amount: 500 } });
+    const hostSocket = await connect(baseUrl, hostCookie);
+    const guestSocket = await connect(baseUrl, guestCookie);
+    await acknowledge(hostSocket, 'table:join', { roomId: room.id });
+    await acknowledge(guestSocket, 'table:join', { roomId: room.id });
+    const [firstHand] = await startWithContributions(hostSocket, guestSocket);
+    expect(firstHand.hand?.number).toBe(1);
+
+    const nextPreparation = nextSnapshotWhere(hostSocket, (snapshot) => snapshot.preparing?.number === 2);
+    const actorSocket = firstHand.hand!.currentPlayerId === host.id ? hostSocket : guestSocket;
+    expect(await acknowledge(actorSocket, 'action:submit', {
+      actionId: 'finish-first-hand', handId: firstHand.hand!.id, version: firstHand.sequence, type: 'fold'
+    })).toMatchObject({ ok: true });
+    const preparation = await nextPreparation;
+    const handId = preparation.preparing!.id;
+    expect(await acknowledge(hostSocket, 'shuffle:contribute', { handId, contribution: 'continuous-host-entropy-0001' })).toEqual({ ok: true });
+    const secondHand = nextSnapshotWhere(hostSocket, (snapshot) => snapshot.hand?.number === 2 && snapshot.hand.status === 'active');
+    expect(await acknowledge(guestSocket, 'shuffle:contribute', { handId, contribution: 'continuous-guest-entropy-001' })).toEqual({ ok: true });
+
+    await expect(secondHand).resolves.toMatchObject({ hand: { number: 2, status: 'active' } });
   });
 
   it('rolls an accepted action back when authoritative persistence fails', async () => {

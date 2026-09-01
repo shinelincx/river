@@ -380,5 +380,5 @@ if (process.env.VITEST === undefined) {
   const persistence = process.env.DATABASE_URL ? PostgresTableRepository.connect(process.env.DATABASE_URL) : undefined;
   await persistence?.migrate();
   const { app } = await buildServer(undefined, persistence);
-  await app.listen({ port: Number(process.env.PORT ?? 3000), host: '0.0.0.0' });
+  await app.listen({ port: Number(process.env.PORT ?? 3000), host: process.env.HOST ?? '0.0.0.0' });
 }

@@ -7,12 +7,22 @@ export type HandHistoryItem = { handId: string; handNumber: number; blinds: { sm
 export type HandReplay = { handId: string; handNumber: number; blinds: { small: number; big: number }; board: Array<{ rank: number; suit: string }>; players: Array<{ id: string; nickname: string; pointDelta: number; hole?: Array<{ rank: number; suit: string }> }>; events: Array<{ sequence: number; type: string; payload: Record<string, unknown> }>; result: { pots: Array<{ amount: number; eligiblePlayerIds: string[] }>; payouts: Record<string, number>; settledBy: 'fold' | 'showdown' }; settledAt: string; expiresAt: string };
 export type HandAuditMaterial = { handId: string; handNumber: number; algorithmVersion: string; serverSeed: string; commitment: string; expiresAt: string; [key: string]: unknown };
 
+const sessionExpiredListeners = new Set<() => void>();
+
+export function subscribeSessionExpired(listener: () => void): () => void {
+  sessionExpiredListeners.add(listener);
+  return () => { sessionExpiredListeners.delete(listener); };
+}
+
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
   if (init.body != null && !headers.has('content-type')) headers.set('content-type', 'application/json');
   const response = await fetch(`/api${path}`, { ...init, credentials: 'include', headers });
   const data = await response.json();
-  if (!response.ok) throw new Error(data.error ?? '请求失败');
+  if (!response.ok) {
+    if (response.status === 401) sessionExpiredListeners.forEach((listener) => listener());
+    throw new Error(data.error ?? '请求失败');
+  }
   return data;
 }
 export const api = {

@@ -8,7 +8,10 @@ import { buildServer } from './index.js';
 import { PostgresTableRepository } from './persistence.js';
 import { RiverStore } from './store.js';
 
-const dockerAvailable = existsSync('/var/run/docker.sock');
+const dockerAvailable = existsSync('/var/run/docker.sock') || Boolean(process.env.DOCKER_HOST);
+if (process.env.REQUIRE_POSTGRES_TESTS === '1' && !dockerAvailable) {
+  throw new Error('PostgreSQL integration tests are required, but no Docker endpoint is available');
+}
 const describeWithPostgres = dockerAvailable ? describe : describe.skip;
 
 describeWithPostgres('PostgreSQL + Testcontainers integration', () => {
@@ -276,6 +279,22 @@ describeWithPostgres('PostgreSQL + Testcontainers integration', () => {
     } finally {
       clock.mockRestore();
     }
+  });
+
+  it('keeps validating the numeric ledger order after the history reaches double-digit ordinals', async () => {
+    const store = new RiverStore();
+    const host = store.createGuest('Ledger host').player;
+    const room = store.createRoom(host.id, { name: 'Double digit ledger', maxSeats: 6, smallBlind: 10, initialChips: 500 });
+    for (let index = 2; index <= 10; index += 1) {
+      store.credit(host.id, room.id, host.id, 1, `double-digit-ledger-${index}`);
+    }
+    expect(store.ledger).toHaveLength(10);
+    await repository.saveStore(store);
+
+    store.createGuest('Ordinal 10');
+
+    await expect(repository.saveStore(store)).resolves.toBeUndefined();
+    await expect(repository.loadStore()).resolves.toEqual(expect.objectContaining({ ledger: expect.any(Array) }));
   });
 
   it('does not bless an offline-corrupted global snapshot during a restart migration', async () => {

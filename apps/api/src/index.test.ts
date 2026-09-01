@@ -126,4 +126,31 @@ describe('HTTP API', () => {
     expect((await app.inject({ method: 'POST', url: `/api/rooms/${room.id}/sit-in`, headers: { cookie: guestCookie } })).statusCode).toBe(200);
     expect(table.players.find((player) => player.id === guestId)?.participation).toBe('seated');
   });
+
+  it('rejects every host-only room mutation from an invited player without changing room state', async () => {
+    const { app, store } = await buildServer(); servers.push(app);
+    const hostResponse = await app.inject({ method: 'POST', url: '/api/guests', payload: { nickname: 'Host' } });
+    const hostCookie = hostResponse.headers['set-cookie'] as string;
+    const hostId = hostResponse.json().player.id as string;
+    const created = await app.inject({ method: 'POST', url: '/api/rooms', headers: { cookie: hostCookie }, payload: { name: 'Authorization', maxSeats: 6, smallBlind: 10, initialChips: 500 } });
+    const room = created.json().room as { id: string; inviteCode: string };
+    const guestResponse = await app.inject({ method: 'POST', url: '/api/guests', payload: { nickname: 'Guest' } });
+    const guestCookie = guestResponse.headers['set-cookie'] as string;
+    const guestId = guestResponse.json().player.id as string;
+    await app.inject({ method: 'POST', url: `/api/invites/${room.inviteCode}/join`, headers: { cookie: guestCookie } });
+
+    const attempts = [
+      app.inject({ method: 'PATCH', url: `/api/rooms/${room.id}/invite`, headers: { cookie: guestCookie }, payload: { open: false } }),
+      app.inject({ method: 'POST', url: `/api/rooms/${room.id}/invite/rotate`, headers: { cookie: guestCookie } }),
+      app.inject({ method: 'POST', url: `/api/rooms/${room.id}/members/${hostId}/remove`, headers: { cookie: guestCookie } }),
+      app.inject({ method: 'POST', url: `/api/rooms/${room.id}/dissolve`, headers: { cookie: guestCookie } })
+    ];
+
+    for (const response of await Promise.all(attempts)) {
+      expect(response.statusCode).toBe(400);
+      expect(response.json().error).toContain('仅房主');
+    }
+    expect(store.rooms.get(room.id)).toMatchObject({ status: 'active', inviteOpen: true, inviteCode: room.inviteCode });
+    expect(store.memberships.get(`${room.id}:${guestId}`)?.status).toBe('active');
+  });
 });
