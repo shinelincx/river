@@ -129,6 +129,18 @@ maxRaiseTo = streetContribution[player] + stack[player]
 
 这是 [Poker TDA Rule 47 与 Illustration Addendum](https://www.pokertda.com/view-poker-tda-rules/) 的直接规则；[WSOP 2026 Rule 96(a)](https://assets.wsopcdn.com/wsop/1a72ba28-781c-409d-a9c3-5ca13c4c5718.pdf) 给出 `500 bet → 1000 raise → 1300 all-in → 1700 all-in` 的例子：累计达到上一完整加注 500 后重新开放，最小可加到 2200。
 
+### 4.4 River 筹码粒度与快捷码量（house rule）
+
+标准规则规定最小下注与最小完整加注，但不规定线上娱乐积分必须采用何种面额。River 采用小盲额作为常规下注/加注的最小单位：10/20 桌的常规目标必须是 10 的整数倍；全下保留精确的剩余积分，即使带有余数也合法。
+
+快捷码量必须先按以下顺序生成，再只显示唯一且可直接提交的目标：
+
+1. 翻牌后无人下注：`1/3 池`、`1/2 池`、`2/3 池`、`满池`。
+2. 翻牌前仅有盲注：`2.5 BB`、`3 BB`、`4 BB`、`全下`。
+3. 面对下注或加注：`最小加注`、`2.5 倍当前下注`、`底池加注`、`全下`；底池加注目标为 `currentBet + potTotal + toCall`。
+
+对每个非全下候选目标执行 `ceil(max(candidate, minRaiseTo) / smallBlind) * smallBlind`。目标超过可全下额时不替换成误导性的比例按钮；只保留“全下”。重复目标合并；因此短码时快捷项可以少于四个，但任何显示的快捷项都能执行，不能置灰。服务端同样校验粒度，客户端只负责引导。
+
 建议每位玩家保存：
 
 ```text

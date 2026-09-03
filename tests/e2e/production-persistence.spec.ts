@@ -46,9 +46,8 @@ test('production API restores the same active hand from PostgreSQL after a proce
 
   await expect(page.locator('.holeCards .playingCard')).toHaveText(hostCards);
   await expect(guestPage.locator('.holeCards .playingCard')).toHaveText(guestCards);
-  const hostFold = page.locator('.foldButton');
-  if (await hostFold.isEnabled()) await hostFold.click();
-  else await guestPage.locator('.foldButton').click();
+  const actingPage = await page.locator('.foldButton').count() ? page : guestPage;
+  await actingPage.locator('.foldButton').click();
   await expect(page.getByRole('button', { name: '手牌记录' })).toBeVisible();
 
   await guestContext.close();

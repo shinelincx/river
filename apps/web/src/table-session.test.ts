@@ -96,4 +96,15 @@ describe('table session recovery', () => {
     expect(socket.emitted.filter(({ event }) => event === 'table:join')).toHaveLength(2);
     session.dispose();
   });
+
+  it('keeps one monotonic authority view across HTTP and Socket snapshots', () => {
+    const socket = new FakeSocket();
+    const session = bindTableSession({ socket, roomId: 'room-4', refreshSnapshot: async () => undefined });
+    expect(session.acceptSnapshot({ sequence: 4, players: ['new'], timing: { serverNow: 100 } })).toBe('accepted');
+    expect(session.acceptSnapshot({ sequence: 3, players: ['old'], timing: { serverNow: 200 } })).toBe('stale');
+    expect(session.acceptSnapshot({ sequence: 4, players: ['new'], timing: { serverNow: 300 } })).toBe('accepted');
+    expect(session.acceptSnapshot({ sequence: 4, players: ['conflict'], timing: { serverNow: 400 } })).toBe('conflict');
+    expect(session.isSynchronized()).toBe(false);
+    session.dispose();
+  });
 });

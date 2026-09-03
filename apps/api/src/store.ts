@@ -1,5 +1,6 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { PokerTable, type SerializedTableState } from './game-engine.js';
+import { projectHandReplay } from './hand-archive.js';
 
 export type Player = { id: string; nickname: string; createdAt: string };
 export type Room = {
@@ -23,11 +24,8 @@ export type SerializedRiverStore = {
 };
 
 const now = () => new Date().toISOString();
-const INVITE_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-const inviteCode = () => {
-  const symbols = [...randomBytes(12)].map((value) => INVITE_CODE_ALPHABET[value & 31]).join('');
-  return `RIVER-${symbols.slice(0, 4)}-${symbols.slice(4, 8)}-${symbols.slice(8)}`;
-};
+const INVITE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+const inviteCode = () => Array.from(randomBytes(8), (byte) => INVITE_ALPHABET[byte & 31]).join('');
 const inviteHash = (code: string) => createHash('sha256').update(code.trim().toUpperCase()).digest('hex');
 
 export class RiverStore {
@@ -115,6 +113,7 @@ export class RiverStore {
     if (input.maxSeats !== 6 && input.maxSeats !== 9) throw new Error('座位数仅支持 6 人或 9 人');
     if (![10, 20, 50, 100].includes(input.smallBlind)) throw new Error('盲注仅支持 10/20、20/40、50/100 或 100/200');
     if (!Number.isSafeInteger(input.initialChips) || input.initialChips < input.smallBlind * 2) throw new Error('初始积分至少为大盲的两倍');
+    if ([...this.rooms.values()].some((room) => room.hostId === hostId && room.status !== 'dissolved')) throw new Error('已经存在进行中的房间，请先关闭后再创建');
     let code = inviteCode(); while ([...this.rooms.values()].some((room) => room.inviteCode === code)) code = inviteCode();
     const room: Room = { id: randomUUID(), hostId, name: input.name.trim(), maxSeats: input.maxSeats, smallBlind: input.smallBlind, bigBlind: input.smallBlind * 2, inviteCode: code, inviteOpen: true, status: 'active', createdAt: now() };
     this.rooms.set(room.id, room);
@@ -139,25 +138,34 @@ export class RiverStore {
 
   roomView(roomId: string, viewerId: string) {
     const room = this.room(roomId);
-    const viewer = this.requireMember(roomId, viewerId, true);
+    const viewer = this.requireMember(roomId, viewerId, false);
+    if (viewer.status === 'closed' && room.status !== 'dissolved') throw new Error('你不是该房间的受邀成员');
     const isHost = viewer.role === 'host';
-    const visibleMemberships = isHost ? this.activeMembers(roomId) : [viewer];
+    const visibleMemberships = isHost ? (room.status === 'dissolved' ? this.membersForRoom(roomId) : this.activeMembers(roomId)) : [viewer];
     return {
       ...room,
       inviteCode: isHost ? room.inviteCode : '',
       members: visibleMemberships.map((membership) => {
         const player = this.players.get(membership.playerId)!;
-        return { id: player.id, nickname: player.nickname, role: membership.role, chips: this.currentChips(roomId, player.id), joinedAt: membership.joinedAt };
+        const finalChips = room.status === 'dissolved' ? this.settlements.find((settlement) => settlement.roomId === roomId && settlement.playerId === player.id)?.finalChips : undefined;
+        const topupChips = this.ledger.filter((entry) => entry.roomId === roomId && entry.playerId === player.id && entry.reason === 'topup').reduce((sum, entry) => sum + entry.amount, 0);
+        return { id: player.id, nickname: player.nickname, role: membership.role, chips: finalChips ?? this.currentChips(roomId, player.id), topupChips, joinedAt: membership.joinedAt };
       }),
       isHost
     };
   }
 
   roomsFor(playerId: string) {
-    return [...this.memberships.values()].filter((membership) => membership.playerId === playerId && membership.status === 'active').map((membership) => {
+    const statusRank: Record<Room['status'], number> = { active: 5, pausing: 4, paused: 3, closing: 2, dissolved: 1 };
+    return [...this.memberships.values()].filter((membership) => {
+      if (membership.playerId !== playerId) return false;
+      const room = this.rooms.get(membership.roomId);
+      return membership.status === 'active' || room?.status === 'dissolved';
+    }).map((membership) => {
       const room = this.rooms.get(membership.roomId)!;
-      return { ...room, inviteCode: membership.role === 'host' ? room.inviteCode : '', role: membership.role, memberCount: this.activeMembers(room.id).length, chips: this.currentChips(room.id, playerId) };
-    });
+      const finalChips = room.status === 'dissolved' ? this.settlements.find((settlement) => settlement.roomId === room.id && settlement.playerId === playerId)?.finalChips : undefined;
+      return { ...room, inviteCode: membership.role === 'host' ? room.inviteCode : '', role: membership.role, memberCount: (room.status === 'dissolved' ? this.membersForRoom(room.id) : this.activeMembers(room.id)).length, chips: finalChips ?? this.currentChips(room.id, playerId) };
+    }).sort((left, right) => statusRank[right.status] - statusRank[left.status] || Date.parse(right.createdAt) - Date.parse(left.createdAt));
   }
 
   historyFor(playerId: string) {
@@ -169,6 +177,7 @@ export class RiverStore {
 
   setInvite(hostId: string, roomId: string, open: boolean): Room {
     const room = this.requireHost(roomId, hostId);
+    this.assertRoomOpen(room);
     if (room.inviteOpen === open) return room;
     if (open) {
       this.issueFreshInvite(room);
@@ -183,6 +192,7 @@ export class RiverStore {
 
   rotateInvite(hostId: string, roomId: string): Room {
     const room = this.requireHost(roomId, hostId);
+    this.assertRoomOpen(room);
     this.issueFreshInvite(room);
     room.inviteOpen = true;
     return room;
@@ -206,7 +216,8 @@ export class RiverStore {
   }
 
   removeMember(hostId: string, roomId: string, playerId: string): Membership {
-    this.requireHost(roomId, hostId);
+    const room = this.requireHost(roomId, hostId);
+    this.assertRoomOpen(room);
     if (playerId === hostId) throw new Error('不支持移除房主');
     const membership = this.requireMember(roomId, playerId, true);
     const hand = this.tables.get(roomId)?.snapshot(hostId).hand;
@@ -217,6 +228,7 @@ export class RiverStore {
 
   credit(hostId: string, roomId: string, playerId: string, amount: number, idempotencyKey: string): LedgerEntry {
     const room = this.requireHost(roomId, hostId);
+    this.assertRoomOpen(room);
     this.requireMember(room.id, playerId, true);
     if (!idempotencyKey) throw new Error('缺少幂等键');
     const previous = this.ledger.find((entry) => entry.idempotencyKey === idempotencyKey);
@@ -231,16 +243,31 @@ export class RiverStore {
   }
 
   ledgerFor(roomId: string, viewerId: string): LedgerEntry[] {
-    this.requireMember(roomId, viewerId, false);
-    const host = this.room(roomId).hostId === viewerId;
-    return this.ledger.filter((entry) => entry.roomId === roomId && (host || entry.playerId === viewerId));
+    const membership = this.requireMember(roomId, viewerId, false);
+    const room = this.room(roomId);
+    if (membership.status === 'closed' && room.status !== 'dissolved') throw new Error('你不是该房间的受邀成员');
+    const host = room.hostId === viewerId;
+    return this.ledger.filter((entry) => entry.roomId === roomId && entry.reason === 'topup' && (host || entry.playerId === viewerId));
   }
 
-  authorizeHandHistory(roomId: string, viewerId: string): void {
-    this.requireMember(roomId, viewerId, false);
+  handHistory(roomId: string, viewerId: string) {
+    const { table, canViewPrivateRoomReplay } = this.handArchive(roomId, viewerId);
+    return table.handHistoryFor(viewerId, Date.now(), canViewPrivateRoomReplay);
   }
 
-  dissolve(hostId: string, roomId: string): Room {
+  handReplay(roomId: string, handId: string, viewerId: string) {
+    const { table, canViewPrivateRoomReplay } = this.handArchive(roomId, viewerId);
+    const replay = table.replayFor(handId, viewerId, Date.now(), canViewPrivateRoomReplay);
+    const { events, ...archive } = replay;
+    return { ...archive, timeline: projectHandReplay(replay.board, events) };
+  }
+
+  handAudit(roomId: string, handId: string, viewerId: string) {
+    const { table } = this.handArchive(roomId, viewerId);
+    return table.auditFor(handId, viewerId);
+  }
+
+  close(hostId: string, roomId: string): Room {
     const room = this.requireHost(roomId, hostId);
     room.inviteOpen = false;
     const table = this.tables.get(roomId);
@@ -248,6 +275,8 @@ export class RiverStore {
     if (table?.snapshot(hostId).hand?.status === 'active') { room.status = 'closing'; return room; }
     this.finalizeDissolve(roomId); return room;
   }
+
+  dissolve(hostId: string, roomId: string): Room { return this.close(hostId, roomId); }
 
   finalizeDissolve(roomId: string): void {
     const room = this.room(roomId);
@@ -339,6 +368,12 @@ export class RiverStore {
     const entry = { id: randomUUID(), roomId, playerId, actorId, amount, reason, idempotencyKey, createdAt: now() };
     this.ledger.push(entry); return entry;
   }
+  private handArchive(roomId: string, viewerId: string): { table: PokerTable; canViewPrivateRoomReplay: boolean } {
+    const membership = this.requireMember(roomId, viewerId, false);
+    const room = this.room(roomId);
+    const table = this.tables.get(roomId); if (!table) throw new Error('牌桌不存在');
+    return { table, canViewPrivateRoomReplay: membership.status === 'active' && room.status !== 'dissolved' };
+  }
   private issueFreshInvite(room: Room): void {
     let code = inviteCode(); while ([...this.rooms.values()].some((item) => item.id !== room.id && item.inviteCode === code)) code = inviteCode();
     room.inviteCode = code;
@@ -349,8 +384,10 @@ export class RiverStore {
     return this.tables.get(roomId)?.players.find((player) => player.id === playerId)?.stack ?? this.balance(roomId, playerId);
   }
   private balance(roomId: string, playerId: string): number { return this.ledger.filter((entry) => entry.roomId === roomId && entry.playerId === playerId).reduce((sum, entry) => sum + entry.amount, 0); }
+  private membersForRoom(roomId: string): Membership[] { return [...this.memberships.values()].filter((membership) => membership.roomId === roomId); }
   private room(roomId: string): Room { const room = this.rooms.get(roomId); if (!room) throw new Error('房间不存在'); return room; }
   private activeMembers(roomId: string): Membership[] { return [...this.memberships.values()].filter((membership) => membership.roomId === roomId && membership.status === 'active'); }
+  private assertRoomOpen(room: Room): void { if (room.status === 'closing' || room.status === 'dissolved') throw new Error('房间已关闭，仅可查看最终积分和补码积分'); }
   private requireMember(roomId: string, playerId: string, active: boolean): Membership { const member = this.memberships.get(this.memberKey(roomId, playerId)); if (!member || (active && member.status !== 'active')) throw new Error('你不是该房间的受邀成员'); return member; }
   private requireHost(roomId: string, playerId: string): Room { const room = this.room(roomId); if (room.hostId !== playerId) throw new Error('仅房主可执行此操作'); return room; }
   private memberKey(roomId: string, playerId: string) { return `${roomId}:${playerId}`; }

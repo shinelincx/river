@@ -21,7 +21,7 @@ export class TableScheduler {
     private readonly store: RiverStore,
     private readonly broadcast: Broadcast,
     private readonly actionTimeoutMs = 20_000,
-    private readonly nextHandDelayMs = 2_000,
+    private readonly nextHandDelayMs = 5_000,
     private readonly reconnectGraceMs = 60_000,
     private readonly persist: Persist = async () => undefined,
     private readonly exclusive: Exclusive = async (_roomId, work) => work()
@@ -213,7 +213,7 @@ export class TableScheduler {
         this.reconnectDeadlines.delete(key);
         const table = this.store.tables.get(roomId);
         const player = table?.players.find((item) => item.id === playerId);
-        if (player && !player.connected) table!.sitOut(playerId);
+        if (player && !player.connected) table!.sitOutAndReleaseSeat(playerId);
         this.scheduleTimeout(roomId, false);
         this.scheduleNextHand(roomId);
         await this.persist(roomId);
@@ -232,7 +232,7 @@ export class TableScheduler {
     const baseReady = table && room?.status === 'active' && snapshot?.hand?.status === 'settled' && !snapshot.preparing
       && table.players.filter((player) => player.stack > 0 && player.seat > 0 && player.participation === 'seated').length >= 2;
     const otherwiseReady = baseReady && table.canStartHand();
-    if (!otherwiseReady || table.hasDisconnectedSeatedPlayers()) {
+    if (!otherwiseReady) {
       if (existing) clearTimeout(existing);
       this.nextHandTimers.delete(roomId);
       if (!baseReady) this.nextHandStarts.delete(roomId);
@@ -252,7 +252,6 @@ export class TableScheduler {
         const ready = currentRoom?.status === 'active'
           && currentHand?.status === 'settled'
           && !currentTable?.snapshot('system').preparing
-          && !currentTable?.hasDisconnectedSeatedPlayers()
           && currentTable?.canStartHand();
         if (!ready || !currentTable) return;
         this.nextHandStarts.delete(roomId);

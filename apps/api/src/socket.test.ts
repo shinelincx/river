@@ -69,6 +69,30 @@ async function startWithContributions(hostSocket: ClientSocket, guestSocket: Cli
 }
 
 describe('Socket table API', () => {
+  it('relays a quick phrase to other joined table connections', async () => {
+    const { app } = await buildServer();
+    servers.push(app);
+    const baseUrl = await app.listen({ port: 0, host: '127.0.0.1' });
+    const hostResponse = await app.inject({ method: 'POST', url: '/api/guests', payload: { nickname: 'Host' } });
+    const hostCookie = hostResponse.headers['set-cookie'] as string;
+    const host = hostResponse.json().player as { id: string };
+    const roomResponse = await app.inject({ method: 'POST', url: '/api/rooms', headers: { cookie: hostCookie }, payload: { name: 'Quick phrase room', maxSeats: 6, smallBlind: 10, initialChips: 500 } });
+    const room = roomResponse.json().room as { id: string; inviteCode: string };
+    const guestResponse = await app.inject({ method: 'POST', url: '/api/guests', payload: { nickname: 'Guest' } });
+    const guestCookie = guestResponse.headers['set-cookie'] as string;
+    await app.inject({ method: 'POST', url: `/api/invites/${room.inviteCode}/join`, headers: { cookie: guestCookie } });
+
+    const hostSocket = await connect(baseUrl, hostCookie);
+    const guestSocket = await connect(baseUrl, guestCookie);
+    expect(await acknowledge(hostSocket, 'table:join', { roomId: room.id })).toEqual({ ok: true });
+    expect(await acknowledge(guestSocket, 'table:join', { roomId: room.id })).toEqual({ ok: true });
+    const received = new Promise<{ playerId: string; phrase: string }>((resolve) => guestSocket.once('table:quick-phrase', resolve));
+
+    expect(await acknowledge(hostSocket, 'table:quick-phrase', { phrase: '我要补码' })).toEqual({ ok: true });
+    await expect(received).resolves.toEqual({ playerId: host.id, phrase: '我要补码' });
+    expect(await acknowledge(hostSocket, 'table:quick-phrase', { phrase: 'invalid' })).toEqual({ ok: false, error: '常用语无效' });
+  });
+
   it('rejects an unauthenticated Socket handshake before a table room can be joined', async () => {
     const { app } = await buildServer();
     servers.push(app);
@@ -244,7 +268,7 @@ describe('Socket table API', () => {
     expect(await acknowledge(guestSocket, 'shuffle:contribute', { handId, contribution: 'continuous-guest-entropy-001' })).toEqual({ ok: true });
 
     await expect(secondHand).resolves.toMatchObject({ hand: { number: 2, status: 'active' } });
-  });
+  }, 10_000);
 
   it('rolls an accepted action back when authoritative persistence fails', async () => {
     const store = new RiverStore();

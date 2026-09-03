@@ -1,10 +1,10 @@
 export type Player = { id: string; nickname: string };
 export type Room = { id: string; name: string; maxSeats: 6 | 9; smallBlind: number; bigBlind: number; inviteCode: string; inviteOpen: boolean; status: string; role?: 'host' | 'member'; memberCount?: number; chips?: number };
-export type Member = { id: string; nickname: string; role: 'host' | 'member'; chips: number };
+export type Member = { id: string; nickname: string; role: 'host' | 'member'; chips: number; topupChips: number };
 export type RoomView = Room & { members: Member[]; isHost: boolean };
 export type LedgerEntry = { id: string; playerId: string; actorId: string; amount: number; reason: string; createdAt: string };
 export type HandHistoryItem = { handId: string; handNumber: number; blinds: { small: number; big: number }; board: Array<{ rank: number; suit: string }>; participants: Array<{ id: string; nickname: string }>; pointDeltas: Record<string, number>; pots: Array<{ amount: number; eligiblePlayerIds: string[] }>; settledBy: 'fold' | 'showdown'; settledAt: string; expiresAt: string };
-export type HandReplay = { handId: string; handNumber: number; blinds: { small: number; big: number }; board: Array<{ rank: number; suit: string }>; players: Array<{ id: string; nickname: string; pointDelta: number; hole?: Array<{ rank: number; suit: string }> }>; events: Array<{ sequence: number; type: string; payload: Record<string, unknown> }>; result: { pots: Array<{ amount: number; eligiblePlayerIds: string[] }>; payouts: Record<string, number>; settledBy: 'fold' | 'showdown' }; settledAt: string; expiresAt: string };
+export type HandReplay = { handId: string; handNumber: number; blinds: { small: number; big: number }; board: Array<{ rank: number; suit: string }>; players: Array<{ id: string; nickname: string; pointDelta: number; hole?: Array<{ rank: number; suit: string }> }>; timeline?: Array<{ id: 'preflop' | 'flop' | 'turn' | 'river' | 'result'; label: string; board: Array<{ rank: number; suit: string }>; moments: Array<{ sequence: number; kind: 'blinds' | 'action' | 'refund' | 'payout'; street: 'preflop' | 'flop' | 'turn' | 'river' | 'result'; playerId?: string; secondaryPlayerId?: string; action?: 'fold' | 'check' | 'call' | 'raise'; amount?: number; secondaryAmount?: number; committedAmount?: number; contributionAfter?: number; betAfter?: number; stackAfter?: number; timedOut?: boolean }> }>; events?: Array<{ sequence: number; type: string; payload: Record<string, unknown> }>; result: { pots: Array<{ amount: number; eligiblePlayerIds: string[] }>; payouts: Record<string, number>; settledBy: 'fold' | 'showdown' }; settledAt: string; expiresAt: string };
 export type HandAuditMaterial = { handId: string; handNumber: number; algorithmVersion: string; serverSeed: string; commitment: string; expiresAt: string; [key: string]: unknown };
 
 const sessionExpiredListeners = new Set<() => void>();
@@ -41,7 +41,7 @@ export const api = {
   sitOut: (roomId: string) => request<{ ok: true }>(`/rooms/${roomId}/sit-out`, { method: 'POST' }),
   ledger: (roomId: string) => request<{ entries: LedgerEntry[] }>(`/rooms/${roomId}/ledger`),
   credit: (roomId: string, playerId: string, amount: number) => request<{ entry: LedgerEntry }>(`/rooms/${roomId}/credits`, { method: 'POST', headers: { 'idempotency-key': crypto.randomUUID() }, body: JSON.stringify({ playerId, amount }) }),
-  dissolve: (roomId: string) => request<{ room: Room }>(`/rooms/${roomId}/dissolve`, { method: 'POST' }),
+  close: (roomId: string) => request<{ room: Room }>(`/rooms/${roomId}/close`, { method: 'POST' }),
   table: (roomId: string, version?: number) => request<{ snapshot: unknown; unchanged: boolean }>(`/rooms/${roomId}/table${version === undefined ? '' : `?version=${version}`}`),
   hands: (roomId: string) => request<{ hands: HandHistoryItem[] }>(`/rooms/${roomId}/hands`),
   replay: (roomId: string, handId: string) => request<{ replay: HandReplay }>(`/rooms/${roomId}/hands/${handId}/replay`),

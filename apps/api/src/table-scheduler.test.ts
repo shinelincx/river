@@ -27,6 +27,28 @@ function startedHeadsUpTable() {
   return { store, room, host };
 }
 
+function startedFullTableWithWaitingPlayer() {
+  const store = new RiverStore();
+  const host = store.createGuest('Host').player;
+  const room = store.createRoom(host.id, { name: 'Full timer test', maxSeats: 6, smallBlind: 10, initialChips: 500 });
+  const seated = [host];
+  for (const nickname of ['Guest 1', 'Guest 2', 'Guest 3', 'Guest 4', 'Guest 5']) {
+    const player = store.createGuest(nickname).player;
+    store.joinByCode(player.id, room.inviteCode);
+    store.credit(host.id, room.id, player.id, 500, `timer-test-credit-${player.id}`);
+    seated.push(player);
+  }
+  for (const player of seated) store.tableFor(room.id, player.id);
+  store.startTable(host.id, room.id);
+  completePreparation(store, room.id);
+
+  const waiting = store.createGuest('Waiting').player;
+  store.joinByCode(waiting.id, room.inviteCode);
+  store.credit(host.id, room.id, waiting.id, 500, `timer-test-credit-${waiting.id}`);
+  store.tableFor(room.id, waiting.id);
+  return { store, room, host, waiting };
+}
+
 describe('table scheduler', () => {
   it('starts the next hand after a timeout settles the current hand', async () => {
     vi.useFakeTimers();
@@ -41,13 +63,13 @@ describe('table scheduler', () => {
     });
     await vi.advanceTimersByTimeAsync(20_000);
     expect(store.tables.get(room.id)?.snapshot(host.id).hand).toMatchObject({ number: 1, status: 'settled' });
-    expect(scheduler.snapshot(room.id, host.id).timing.nextHandStartsAt).toBe(Date.parse('2026-08-28T12:00:22Z'));
+    expect(scheduler.snapshot(room.id, host.id).timing.nextHandStartsAt).toBe(Date.parse('2026-08-28T12:00:25Z'));
 
-    await vi.advanceTimersByTimeAsync(2_000);
+    await vi.advanceTimersByTimeAsync(5_000);
     completePreparation(store, room.id);
     await scheduler.stateChanged(room.id);
     expect(store.tables.get(room.id)?.snapshot(host.id).hand).toMatchObject({ number: 2, status: 'active' });
-    expect(scheduler.snapshot(room.id, host.id).timing.actionDeadlineAt).toBe(Date.parse('2026-08-28T12:00:42Z'));
+    expect(scheduler.snapshot(room.id, host.id).timing.actionDeadlineAt).toBe(Date.parse('2026-08-28T12:00:45Z'));
     scheduler.close();
   });
 
@@ -77,10 +99,10 @@ describe('table scheduler', () => {
     await scheduler.fundingChanged(room.id);
     expect(scheduler.snapshot(room.id, host.id).timing).toMatchObject({
       waitingForPlayers: false,
-      nextHandStartsAt: Date.parse('2026-08-28T12:00:05Z')
+      nextHandStartsAt: Date.parse('2026-08-28T12:00:08Z')
     });
 
-    await vi.advanceTimersByTimeAsync(2_000);
+    await vi.advanceTimersByTimeAsync(5_000);
     completePreparation(store, room.id);
     await scheduler.stateChanged(room.id);
     expect(table.snapshot(host.id).hand).toMatchObject({ number: 2, status: 'active' });
@@ -106,7 +128,7 @@ describe('table scheduler', () => {
 
     expect(table.players.find((player) => player.id === waiting.id)).toMatchObject({ seat: expect.any(Number), participation: 'seated' });
     expect(table.players.find((player) => player.id === waiting.id)!.seat).toBeGreaterThan(0);
-    expect(scheduler.snapshot(room.id, host.id).timing.nextHandStartsAt).toBe(Date.parse('2026-08-28T12:00:02Z'));
+    expect(scheduler.snapshot(room.id, host.id).timing.nextHandStartsAt).toBe(Date.parse('2026-08-28T12:00:05Z'));
     scheduler.close();
   });
 
@@ -283,9 +305,51 @@ describe('table scheduler', () => {
     await vi.advanceTimersByTimeAsync(1);
     expect(table.snapshot(host.id).players.find((player) => player.id === disconnectedPlayerId)).toMatchObject({
       connected: false,
-      participation: 'sitting-out'
+      participation: 'sitting-out',
+      seat: 0
     });
     expect(scheduler.snapshot(room.id, host.id).timing.reconnectDeadlines).toEqual({});
+    scheduler.close();
+  });
+
+  it('continues with connected players and assigns a timed-out seat to a waiting player', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-08-28T12:00:00Z'));
+    const { store, room, host, waiting } = startedFullTableWithWaitingPlayer();
+    const table = store.tables.get(room.id)!;
+    const scheduler = new TableScheduler(store, async () => undefined);
+    const disconnected = table.players.find((player) => player.id !== table.snapshot(host.id).hand!.currentPlayerId && player.id !== waiting.id)!;
+    const releasedSeat = disconnected.seat;
+
+    await scheduler.join(room.id);
+    await scheduler.presenceChanged(room.id, disconnected.id, false);
+    for (let turn = 0; table.snapshot(host.id).hand?.status === 'active' && turn < 24; turn += 1) {
+      table.timeout(table.snapshot(host.id).hand!.currentPlayerId!);
+    }
+    expect(table.snapshot(host.id).hand).toMatchObject({ number: 1, status: 'settled' });
+
+    await scheduler.stateChanged(room.id);
+    expect(scheduler.snapshot(room.id, host.id).timing.nextHandStartsAt).toBe(Date.parse('2026-08-28T12:00:05Z'));
+    await vi.advanceTimersByTimeAsync(5_000);
+    completePreparation(store, room.id);
+    await scheduler.stateChanged(room.id);
+    expect(table.snapshot(host.id).hand).toMatchObject({ number: 2, status: 'active' });
+
+    await vi.advanceTimersByTimeAsync(55_000);
+    expect(table.snapshot(host.id).players.find((player) => player.id === disconnected.id)).toMatchObject({
+      connected: false,
+      participation: 'sitting-out',
+      seat: 0
+    });
+
+    for (let turn = 0; table.snapshot(host.id).hand?.status === 'active' && turn < 24; turn += 1) {
+      table.timeout(table.snapshot(host.id).hand!.currentPlayerId!);
+    }
+    await scheduler.stateChanged(room.id);
+    expect(table.snapshot(host.id).players.find((player) => player.id === waiting.id)).toMatchObject({
+      participation: 'seated',
+      seat: releasedSeat
+    });
     scheduler.close();
   });
 });

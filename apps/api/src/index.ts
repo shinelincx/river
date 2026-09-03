@@ -11,6 +11,7 @@ import { validateRuntimeConfiguration } from './runtime-config.js';
 declare module 'fastify' { interface FastifyRequest { riverPlayerId?: string } }
 
 const SESSION_COOKIE = 'river_session';
+const QUICK_PHRASES = new Set(['我要补码', '6 6 6 打得不错', '搞快点 搞快点', '我很大', '含住', '不玩啦', '跟到底！', '这手稳了']);
 const playerIdFromCookie = (header?: string) => header?.match(new RegExp(`(?:^|;\\s*)${SESSION_COOKIE}=([^;]+)`))?.[1];
 
 function validateNickname(value: unknown): string {
@@ -190,7 +191,15 @@ export async function buildServer(providedStore?: RiverStore, persistence?: Post
   app.post('/api/rooms/:roomId/dissolve', async (request) => {
     const roomId = (request.params as { roomId: string }).roomId;
     return runAuthoritative(roomId, async () => {
-      const room = store.dissolve(requirePlayer(request), roomId);
+      const room = store.close(requirePlayer(request), roomId);
+      await scheduler.fundingChanged(roomId);
+      return { room };
+    });
+  });
+  app.post('/api/rooms/:roomId/close', async (request) => {
+    const roomId = (request.params as { roomId: string }).roomId;
+    return runAuthoritative(roomId, async () => {
+      const room = store.close(requirePlayer(request), roomId);
       await scheduler.fundingChanged(roomId);
       return { room };
     });
@@ -199,7 +208,8 @@ export async function buildServer(providedStore?: RiverStore, persistence?: Post
   app.get('/api/rooms/:roomId/table', async (request) => {
     const roomId = (request.params as { roomId: string }).roomId;
     const playerId = requirePlayer(request);
-    store.roomView(roomId, playerId);
+    const room = store.roomView(roomId, playerId);
+    if (room.status === 'dissolved') throw new Error('房间已关闭，仅可查看最终积分和补码积分');
     if (!store.tables.has(roomId)) throw new Error('牌桌不存在');
     const snapshot = scheduler.snapshot(roomId, playerId);
     const version = Number((request.query as { version?: string }).version);
@@ -208,32 +218,24 @@ export async function buildServer(providedStore?: RiverStore, persistence?: Post
   app.get('/api/rooms/:roomId/hands', async (request) => {
     const roomId = (request.params as { roomId: string }).roomId;
     const playerId = requirePlayer(request);
-    store.authorizeHandHistory(roomId, playerId);
-    const table = store.tables.get(roomId); if (!table) throw new Error('牌桌不存在');
-    return { hands: table.handHistoryFor(playerId) };
+    return { hands: store.handHistory(roomId, playerId) };
   });
   app.get('/api/rooms/:roomId/hands/:handId/replay', async (request) => {
     const { roomId, handId } = request.params as { roomId: string; handId: string };
     const playerId = requirePlayer(request);
-    store.authorizeHandHistory(roomId, playerId);
-    const table = store.tables.get(roomId); if (!table) throw new Error('牌桌不存在');
-    return { replay: table.replayFor(handId, playerId) };
+    return { replay: store.handReplay(roomId, handId, playerId) };
   });
   app.get('/api/rooms/:roomId/hands/:handId/audit', async (request) => {
     const { roomId, handId } = request.params as { roomId: string; handId: string };
     const playerId = requirePlayer(request);
-    store.authorizeHandHistory(roomId, playerId);
-    const table = store.tables.get(roomId); if (!table) throw new Error('牌桌不存在');
-    return { audit: table.auditFor(handId, playerId) };
+    return { audit: store.handAudit(roomId, handId, playerId) };
   });
   app.get('/api/rooms/:roomId/hands/:handId/audit/verify', async (request) => {
     const { roomId, handId } = request.params as { roomId: string; handId: string };
     const playerId = requirePlayer(request);
-    store.authorizeHandHistory(roomId, playerId);
-    const table = store.tables.get(roomId); if (!table) throw new Error('牌桌不存在');
-    const audit = table.auditFor(handId, playerId);
+    const audit = store.handAudit(roomId, handId, playerId);
     const trustedCommitment = await persistence?.handCommitment(roomId, handId);
-    return { verified: verifyHandAudit(audit, trustedCommitment), expiresAt: audit.expiresAt, algorithmVersion: audit.algorithmVersion };
+    return { verified: await verifyHandAudit(audit, trustedCommitment), expiresAt: audit.expiresAt, algorithmVersion: audit.algorithmVersion };
   });
 
   const io = new Server(app.server, { cors: { origin: [/^http:\/\/localhost:\d+$/], credentials: true } });
@@ -258,7 +260,7 @@ export async function buildServer(providedStore?: RiverStore, persistence?: Post
       socket.data.lastEventSequence = table.recentEvents.at(-1)?.sequence ?? lastEventSequence;
     }
   };
-  scheduler = new TableScheduler(store, broadcastSnapshots, 20_000, 2_000, 60_000, async () => persistAll(), runAuthoritative);
+  scheduler = new TableScheduler(store, broadcastSnapshots, 20_000, 5_000, 60_000, async () => persistAll(), runAuthoritative);
   const purgeExpiredMaterials = async () => {
     const currentTime = Date.now();
     let memoryPurged = 0;
@@ -322,6 +324,15 @@ export async function buildServer(providedStore?: RiverStore, persistence?: Post
         socket.data.roomId = undefined;
         socket.emit('table:revoked');
       }
+    });
+    socket.on('table:quick-phrase', ({ phrase }: { phrase?: unknown }, acknowledge) => {
+      try {
+        const roomId = socket.data.roomId; if (!roomId) throw new Error('尚未进入牌桌');
+        if (typeof phrase !== 'string' || !QUICK_PHRASES.has(phrase)) throw new Error('常用语无效');
+        store.roomView(roomId, socket.data.playerId);
+        socket.to(`table:${roomId}`).emit('table:quick-phrase', { playerId: socket.data.playerId, phrase });
+        acknowledge?.({ ok: true });
+      } catch (error) { acknowledge?.({ ok: false, error: (error as Error).message }); }
     });
     socket.on('table:start', async (acknowledge) => {
       try {

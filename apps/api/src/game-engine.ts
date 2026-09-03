@@ -1,8 +1,10 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { verifyAuditMaterial } from '../../../packages/audit-verifier/index.js';
 
 export type Suit = 'S' | 'H' | 'D' | 'C';
 export type Card = { rank: number; suit: Suit };
 export type Action = { type: 'fold' | 'check' | 'call' | 'raise'; amount?: number };
+export type AnnouncedActionType = 'fold' | 'check' | 'call' | 'bet' | 'raise' | 'allIn';
 export type ActionCommand = { actionId: string; handId: string; version: number; type: string; raiseTo?: number };
 export type Street = 'preflop' | 'flop' | 'turn' | 'river' | 'showdown';
 export type Participation = 'seated' | 'waiting' | 'sitting-out';
@@ -90,6 +92,7 @@ type HandState = {
   pending: Set<string>;
   actedAtBet: Map<string, number>;
   status: 'active' | 'settled';
+  lastAction?: { sequence: number; playerId: string; type: AnnouncedActionType };
   settledBy?: 'fold' | 'showdown';
 };
 export type SerializedTableState = {
@@ -154,116 +157,8 @@ function serverCommitment(): { seed: string; commitment: string } {
   return { seed, commitment };
 }
 
-export function verifyHandAudit(audit: HandAudit, trustedCommitment?: string): boolean {
-  const commitment = createHash('sha256').update(`${audit.algorithmVersion}:${audit.serverSeed}`).digest('hex');
-  if (commitment !== audit.commitment) return false;
-  if (trustedCommitment !== undefined && trustedCommitment !== audit.commitment) return false;
-  const shuffleEvents = audit.events.filter((event) => event.type === 'shuffle_committed');
-  const startedEvents = audit.events.filter((event) => event.type === 'hand_started');
-  const settlementEvents = audit.events.filter((event) => event.type === 'hand_settled');
-  if (shuffleEvents.length !== 1 || startedEvents.length !== 1 || settlementEvents.length !== 1) return false;
-  const identityEvents = [shuffleEvents[0], startedEvents[0], settlementEvents[0]];
-  if (identityEvents.some((event) => event.payload.handId !== audit.handId || event.payload.commitment !== audit.commitment)) return false;
-  if (shuffleEvents[0].payload.number !== audit.handNumber || startedEvents[0].payload.number !== audit.handNumber) return false;
-  if (shuffleEvents[0].payload.algorithmVersion !== audit.algorithmVersion || startedEvents[0].payload.algorithmVersion !== audit.algorithmVersion) return false;
-  if (startedEvents[0].payload.dealerSeat !== audit.dealerSeat) return false;
-  const committedParticipants = shuffleEvents[0].payload.participantIds;
-  if (!Array.isArray(committedParticipants)
-    || JSON.stringify([...committedParticipants].sort()) !== JSON.stringify([...audit.participantIds].sort())) return false;
-  const reconstructed = deterministicDeck(audit.serverSeed, audit.playerContributions, audit.handId);
-  if (reconstructed.map(cardText).join(',') !== audit.deck.map(cardText).join(',')) return false;
-
-  const deck = structuredClone(reconstructed);
-  for (const playerId of audit.dealOrder) {
-    const expected = [deck.pop()!, deck.pop()!];
-    if (expected.map(cardText).join(',') !== audit.holeCards[playerId]?.map(cardText).join(',')) return false;
-  }
-  const expectedBoard = Array.from({ length: audit.board.length }, () => deck.pop()!);
-  if (expectedBoard.map(cardText).join(',') !== audit.board.map(cardText).join(',')) return false;
-
-  const replayedContributions = Object.fromEntries(audit.participantIds.map((id) => [id, 0]));
-  const seenActionIds = new Set<string>();
-  const foldedFromActions = new Set<string>();
-  for (const event of audit.events) {
-    if (event.type === 'blinds_posted') {
-      const smallId = event.payload.smallBlindPlayerId as string;
-      const bigId = event.payload.bigBlindPlayerId as string;
-      replayedContributions[smallId] = Number(event.payload.smallBlindAmount);
-      replayedContributions[bigId] = Number(event.payload.bigBlindAmount);
-    }
-    if (event.type === 'action') {
-      const actionId = event.payload.actionId as string;
-      const playerId = event.payload.playerId as string;
-      const actionKey = `${playerId}:${actionId}`;
-      if (!actionId || seenActionIds.has(actionKey)) return false;
-      seenActionIds.add(actionKey);
-      const committedAmount = Number(event.payload.committedAmount);
-      if (!Number.isSafeInteger(committedAmount) || committedAmount < 0 || !(playerId in replayedContributions)) return false;
-      replayedContributions[playerId] += committedAmount;
-      if (replayedContributions[playerId] !== event.payload.contributionAfter) return false;
-      if (event.payload.type === 'fold') foldedFromActions.add(playerId);
-    }
-  }
-  if (JSON.stringify(sortedRecord(replayedContributions)) !== JSON.stringify(sortedRecord(audit.contributionsBeforeRefund))) return false;
-
-  const ranked = Object.entries(audit.contributionsBeforeRefund).filter(([, amount]) => amount > 0).sort(([, a], [, b]) => b - a);
-  const expectedFinal = { ...audit.contributionsBeforeRefund };
-  const expectedRefund = ranked.length > 0 && ranked[0][1] > (ranked[1]?.[1] ?? 0)
-    ? { playerId: ranked[0][0], amount: ranked[0][1] - (ranked[1]?.[1] ?? 0) }
-    : undefined;
-  if (expectedRefund) expectedFinal[expectedRefund.playerId] -= expectedRefund.amount;
-  if (JSON.stringify(expectedRefund) !== JSON.stringify(audit.result.refund)) return false;
-  if (JSON.stringify(sortedRecord(expectedFinal)) !== JSON.stringify(sortedRecord(audit.finalContributions))) return false;
-
-  if (JSON.stringify([...foldedFromActions].sort()) !== JSON.stringify([...audit.foldedPlayerIds].sort())) return false;
-  const remainingPlayerIds = audit.participantIds.filter((playerId) => !foldedFromActions.has(playerId));
-  const expectedSettledBy = remainingPlayerIds.length === 1 ? 'fold' : 'showdown';
-  if (audit.result.settledBy !== expectedSettledBy || (expectedSettledBy === 'showdown' && audit.board.length !== 5)) return false;
-  if (settlementEvents[0].payload.settledBy !== expectedSettledBy) return false;
-
-  const folded = foldedFromActions;
-  const pots = potBreakdownFrom(audit.finalContributions, folded);
-  if (JSON.stringify(pots) !== JSON.stringify(audit.result.pots)) return false;
-  const payouts: Record<string, number> = {};
-  for (const pot of pots) {
-    const eligible = pot.eligiblePlayerIds;
-    if (eligible.length === 0) return false;
-    const winners = eligible.length === 1 ? eligible : (() => {
-      const ranks = eligible.map((playerId) => ({ playerId, rank: evaluateSeven([...(audit.holeCards[playerId] ?? []), ...audit.board]) }));
-      const best = ranks.reduce((winner, item) => compareRanks(item.rank, winner) > 0 ? item.rank : winner, ranks[0].rank);
-      return ranks.filter((item) => compareRanks(item.rank, best) === 0).map((item) => item.playerId);
-    })();
-    const ordered = [...winners].sort((a, b) => leftOfButtonDistance(audit.seatByPlayerId[a], audit.dealerSeat, audit.maxSeats) - leftOfButtonDistance(audit.seatByPlayerId[b], audit.dealerSeat, audit.maxSeats));
-    const share = Math.floor(pot.amount / ordered.length);
-    let remainder = pot.amount % ordered.length;
-    for (const winner of ordered) payouts[winner] = (payouts[winner] ?? 0) + share + (remainder-- > 0 ? 1 : 0);
-  }
-  if (JSON.stringify(sortedRecord(payouts)) !== JSON.stringify(sortedRecord(audit.result.payouts))) return false;
-  const settlement = settlementEvents[0].payload;
-  if (!settlement.payouts || typeof settlement.payouts !== 'object') return false;
-  return JSON.stringify(settlement.board) === JSON.stringify(audit.board)
-    && JSON.stringify(settlement.pots) === JSON.stringify(pots)
-    && JSON.stringify(settlement.refund) === JSON.stringify(expectedRefund)
-    && JSON.stringify(sortedRecord(settlement.payouts as Record<string, number>)) === JSON.stringify(sortedRecord(payouts));
-}
-
-function sortedRecord<T>(record: Record<string, T>): Record<string, T> {
-  return Object.fromEntries(Object.entries(record).sort(([a], [b]) => a.localeCompare(b)));
-}
-
-function potBreakdownFrom(contributions: Record<string, number>, folded: Set<string>): PotView[] {
-  const levels = [...new Set(Object.values(contributions).filter((amount) => amount > 0))].sort((a, b) => a - b);
-  let previous = 0;
-  return levels.map((level) => {
-    const involved = Object.entries(contributions).filter(([, amount]) => amount >= level).map(([id]) => id);
-    const amount = (level - previous) * involved.length;
-    previous = level;
-    return { amount, eligiblePlayerIds: involved.filter((id) => !folded.has(id)) };
-  }).filter((pot) => pot.amount > 0);
-}
-
-function leftOfButtonDistance(seat: number, dealerSeat: number, maxSeats: number): number {
-  return (seat - dealerSeat + maxSeats) % maxSeats || maxSeats;
+export async function verifyHandAudit(audit: HandAudit, trustedCommitment?: string): Promise<boolean> {
+  return (await verifyAuditMaterial(audit, trustedCommitment)).verified;
 }
 
 function combinations<T>(items: T[], size: number): T[][] {
@@ -426,6 +321,15 @@ export class PokerTable {
     this.record('player_sat_out', { playerId });
   }
 
+  sitOutAndReleaseSeat(playerId: string): void {
+    this.sitOut(playerId);
+    const player = this.player(playerId);
+    if (player.seat === 0) return;
+    const seat = player.seat;
+    player.seat = 0;
+    this.record('seat_released', { playerId, seat, reason: 'disconnect_timeout' });
+  }
+
   sitIn(playerId: string): void {
     const player = this.player(playerId);
     if (player.stack <= 0) throw new Error('积分不足，无法坐入');
@@ -479,11 +383,11 @@ export class PokerTable {
     }));
   }
 
-  handHistoryFor(viewerId: string, currentTime = Date.now()) {
-    const isCurrentPlayer = this.players.some((player) => player.id === viewerId);
-    if (!isCurrentPlayer && ![...this.audits.values()].some((audit) => audit.participantIds.includes(viewerId))) throw new Error('无权读取该牌桌手牌记录');
+  handHistoryFor(viewerId: string, currentTime = Date.now(), canViewPrivateRoomReplay = false) {
+    const isParticipant = [...this.audits.values()].some((audit) => audit.participantIds.includes(viewerId));
+    if (!canViewPrivateRoomReplay && !isParticipant) throw new Error('无权读取该牌桌手牌记录');
     return [...this.audits.values()]
-      .filter((audit) => Date.parse(audit.expiresAt) > currentTime && (isCurrentPlayer || audit.participantIds.includes(viewerId)))
+      .filter((audit) => Date.parse(audit.expiresAt) > currentTime && (canViewPrivateRoomReplay || audit.participantIds.includes(viewerId)))
       .sort((a, b) => b.handNumber - a.handNumber)
       .map((audit) => ({
         handId: audit.handId,
@@ -508,11 +412,11 @@ export class PokerTable {
     return structuredClone(audit);
   }
 
-  replayFor(handId: string, viewerId: string, currentTime = Date.now()) {
+  replayFor(handId: string, viewerId: string, currentTime = Date.now(), canViewPrivateRoomReplay = false) {
     if (this.hand?.id === handId && this.hand.status === 'active') throw new Error('回放不存在或手牌尚未结算');
     const audit = this.audits.get(handId);
     if (!audit) throw new Error('回放不存在或手牌尚未结算');
-    if (!audit.participantIds.includes(viewerId) && !this.players.some((player) => player.id === viewerId)) throw new Error('无权读取该手回放');
+    if (!audit.participantIds.includes(viewerId) && !canViewPrivateRoomReplay) throw new Error('无权读取该手回放');
     if (Date.parse(audit.expiresAt) <= currentTime) throw new Error('回放已过期');
     const foldedIds = new Set(audit.events
       .filter((event) => event.type === 'action' && event.payload.type === 'fold')
@@ -594,6 +498,7 @@ export class PokerTable {
     const contributionBefore = player.contribution;
     if (player.folded || player.allIn) throw new Error('此玩家不能行动');
     const owed = hand.currentBet - player.bet;
+    const isOpeningBet = action.type === 'raise' && hand.currentBet === 0;
     if (action.type === 'fold') {
       player.folded = true;
     } else if (action.type === 'check') {
@@ -612,6 +517,7 @@ export class PokerTable {
       const isAllIn = added === player.stack;
       const minimumTarget = hand.currentBet === 0 ? hand.minRaise : hand.currentBet + hand.minRaise;
       if (!isAllIn && target < minimumTarget) throw new Error('加注额不足');
+      if (!isAllIn && target % this.smallBlind !== 0) throw new Error('下注必须是小盲的整数倍');
       const raiseSize = target - hand.currentBet;
       this.commit(player, added);
       hand.currentBet = player.bet;
@@ -621,6 +527,11 @@ export class PokerTable {
     hand.actedAtBet.set(playerId, hand.currentBet);
     hand.pending.delete(playerId);
     const beforeVersion = metadata.beforeVersion ?? this.eventSequence;
+    hand.lastAction = {
+      sequence: beforeVersion + 1,
+      playerId,
+      type: player.allIn ? 'allIn' : isOpeningBet ? 'bet' : action.type
+    };
     this.record('action', {
       handId: hand.id,
       playerId,
@@ -688,6 +599,7 @@ export class PokerTable {
   snapshot(viewerId: string) {
     const hand = this.hand;
     const pots = hand ? this.potBreakdown() : [];
+    const settlement = hand?.status === 'settled' ? this.audits.get(hand.id)?.result : undefined;
     return {
       roomId: this.roomId,
       sequence: this.eventSequence,
@@ -706,7 +618,10 @@ export class PokerTable {
         id: hand.id, number: hand.number, commitment: hand.commitment, board: hand.board, street: hand.street,
         dealerSeat: hand.dealerSeat, smallBlindSeat: hand.smallBlindSeat, bigBlindSeat: hand.bigBlindSeat,
         currentPlayerId: hand.currentPlayerId, currentBet: hand.currentBet, minRaise: hand.minRaise, status: hand.status,
-        potTotal: pots.reduce((sum, pot) => sum + pot.amount, 0), pots, legalActions: this.legalActions(viewerId)
+        lastAction: hand.lastAction && structuredClone(hand.lastAction),
+        potTotal: pots.reduce((sum, pot) => sum + pot.amount, 0), pots,
+        settlement: settlement && { settledBy: settlement.settledBy, payouts: structuredClone(settlement.payouts) },
+        legalActions: this.legalActions(viewerId)
       }
     };
   }

@@ -1,4 +1,5 @@
-export type TableSoundEvent = 'deal' | 'settle' | 'action' | 'turn' | 'allIn';
+export type TableActionSound = 'fold' | 'check' | 'call' | 'bet' | 'raise' | 'allIn';
+export type TableSoundEvent = 'deal' | 'settle' | TableActionSound | 'turn';
 
 export type SoundSnapshot = {
   sequence: number;
@@ -8,6 +9,7 @@ export type SoundSnapshot = {
     status: 'active' | 'settled';
     board: unknown[];
     currentPlayerId?: string;
+    lastAction?: { sequence: number; playerId: string; type: TableActionSound };
   };
 };
 
@@ -18,14 +20,15 @@ export function tableSoundEvents(previous: SoundSnapshot, next: SoundSnapshot, v
   if (!nextHand) return events;
 
   const settledNow = previousHand?.status !== 'settled' && nextHand.status === 'settled';
+  const actionOccurred = !!nextHand.lastAction && nextHand.lastAction.sequence !== previousHand?.lastAction?.sequence;
   if (!previousHand || nextHand.number > previousHand.number) events.push('deal');
-  else if (settledNow) events.push('settle');
+  else if (settledNow) {
+    if (actionOccurred) events.push(nextHand.lastAction!.type);
+    events.push('settle');
+  }
   else if (nextHand.board.length > previousHand.board.length) events.push('deal');
-  else if (next.sequence > previous.sequence) events.push('action');
+  else if (actionOccurred) events.push(nextHand.lastAction!.type);
 
   if (nextHand.currentPlayerId === viewerId && nextHand.currentPlayerId !== previousHand?.currentPlayerId) events.push('turn');
-  const sameHand = previousHand?.number === nextHand.number;
-  const newlyAllIn = next.players.some((nextPlayer) => nextPlayer.allIn && (!sameHand || !previous.players.find((item) => item.id === nextPlayer.id)?.allIn));
-  if (newlyAllIn && !settledNow) events.push('allIn');
   return events;
 }

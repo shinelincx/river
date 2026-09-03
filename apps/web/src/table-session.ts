@@ -10,7 +10,11 @@ export type TableSessionSocket = {
 export type TableSession = {
   recover(): void;
   dispose(): void;
+  acceptSnapshot(snapshot: TableSnapshot): 'accepted' | 'stale' | 'conflict';
+  isSynchronized(): boolean;
 };
+
+export type TableSnapshot = { sequence: number; timing?: { serverNow?: number; [key: string]: unknown }; [key: string]: unknown };
 
 type TableSessionOptions = {
   socket: TableSessionSocket;
@@ -38,6 +42,14 @@ export function bindTableSession({
   let joinTimer: ReturnType<typeof setTimeout> | undefined;
   let retryTimer: ReturnType<typeof setTimeout> | undefined;
   let syncTimer: ReturnType<typeof setTimeout> | undefined;
+  let currentSnapshot: TableSnapshot | undefined;
+  let synchronized = true;
+
+  const authorityShape = (snapshot: TableSnapshot) => {
+    const { timing, ...rest } = snapshot;
+    const { serverNow: _serverNow, ...authorityTiming } = timing ?? {};
+    return JSON.stringify({ ...rest, timing: authorityTiming });
+  };
 
   const clearTimer = (timer: ReturnType<typeof setTimeout> | undefined) => {
     if (timer !== undefined) clearTimeout(timer);
@@ -124,6 +136,20 @@ export function bindTableSession({
       clearPending();
       socket.off('connect', handleConnect);
       socket.off('disconnect', handleDisconnect);
+    },
+    acceptSnapshot(snapshot) {
+      if (currentSnapshot && snapshot.sequence < currentSnapshot.sequence) return 'stale';
+      if (currentSnapshot && snapshot.sequence === currentSnapshot.sequence && authorityShape(snapshot) !== authorityShape(currentSnapshot)) {
+        synchronized = false;
+        this.recover();
+        return 'conflict';
+      }
+      currentSnapshot = snapshot;
+      synchronized = true;
+      return 'accepted';
+    },
+    isSynchronized() {
+      return synchronized;
     }
   };
 }

@@ -51,6 +51,34 @@ describe('server-authoritative table', () => {
     expect(table.snapshot('a').hand?.status).toBe('active');
   });
 
+  it('publishes the exact professional action for table announcements', () => {
+    const table = new PokerTable('room-action-announcement', 10, 20, 6);
+    table.addPlayer({ id: 'a', nickname: 'Alpha', stack: 500 });
+    table.addPlayer({ id: 'b', nickname: 'Bravo', stack: 500 });
+    startHand(table);
+
+    const preflopActor = table.snapshot('a').hand!.currentPlayerId!;
+    table.takeAction(preflopActor, { type: 'call' });
+
+    expect(table.snapshot('a').hand?.lastAction).toMatchObject({ playerId: preflopActor, type: 'call' });
+    const blindPlayer = table.snapshot('a').hand!.currentPlayerId!;
+    table.takeAction(blindPlayer, { type: 'check' });
+    const flopActor = table.snapshot('a').hand!.currentPlayerId!;
+    table.takeAction(flopActor, { type: 'raise', amount: 20 });
+
+    expect(table.snapshot('a').hand?.lastAction).toMatchObject({ playerId: flopActor, type: 'bet' });
+
+    const allInTable = new PokerTable('room-all-in-announcement', 10, 20, 6);
+    allInTable.addPlayer({ id: 'a', nickname: 'Alpha', stack: 500 });
+    allInTable.addPlayer({ id: 'b', nickname: 'Bravo', stack: 500 });
+    startHand(allInTable);
+    const allInActor = allInTable.snapshot('a').hand!.currentPlayerId!;
+    const maxRaiseTo = allInTable.snapshot(allInActor).hand!.legalActions!.maxRaiseTo;
+    allInTable.takeAction(allInActor, { type: 'raise', amount: maxRaiseTo });
+
+    expect(allInTable.snapshot('a').hand?.lastAction).toMatchObject({ playerId: allInActor, type: 'allIn' });
+  });
+
   it('keeps a player who joins mid-hand waiting until the next hand boundary', () => {
     const table = new PokerTable('room-waiting-seat', 10, 20, 6);
     table.addPlayer({ id: 'a', nickname: 'Alpha', stack: 500 });
@@ -74,7 +102,7 @@ describe('server-authoritative table', () => {
     expect(table.snapshot('c').players.find((player) => player.id === 'c')?.hole).toHaveLength(2);
   });
 
-  it('reveals a verifiable shuffle audit only to participants for 10 days after settlement', () => {
+  it('reveals a verifiable shuffle audit only to participants for 10 days after settlement', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-08-28T12:00:00Z'));
     const table = new PokerTable('room-audit', 10, 20, 6);
@@ -94,19 +122,19 @@ describe('server-authoritative table', () => {
       a: 'alpha-device-entropy-0001',
       b: 'bravo-device-entropy-0001'
     });
-    expect(verifyHandAudit(audit)).toBe(true);
+    expect(await verifyHandAudit(audit)).toBe(true);
     const tamperedHoleCards = structuredClone(audit);
     tamperedHoleCards.holeCards.a = [...tamperedHoleCards.holeCards.b];
-    expect(verifyHandAudit(tamperedHoleCards)).toBe(false);
+    expect(await verifyHandAudit(tamperedHoleCards)).toBe(false);
     const tamperedPayout = structuredClone(audit);
     tamperedPayout.result.payouts.a = (tamperedPayout.result.payouts.a ?? 0) + 1;
-    expect(verifyHandAudit(tamperedPayout)).toBe(false);
+    expect(await verifyHandAudit(tamperedPayout)).toBe(false);
     const falsifiedFold = structuredClone(audit);
     falsifiedFold.foldedPlayerIds = audit.participantIds.filter((id) => !audit.foldedPlayerIds.includes(id)).slice(0, 1);
-    expect(verifyHandAudit(falsifiedFold)).toBe(false);
+    expect(await verifyHandAudit(falsifiedFold)).toBe(false);
     const falsifiedSettlement = structuredClone(audit);
     falsifiedSettlement.events.find((event) => event.type === 'hand_settled')!.payload.settledBy = 'showdown';
-    expect(verifyHandAudit(falsifiedSettlement)).toBe(false);
+    expect(await verifyHandAudit(falsifiedSettlement)).toBe(false);
     const rewrittenCommitment = structuredClone(audit);
     rewrittenCommitment.serverSeed = 'f'.repeat(64);
     rewrittenCommitment.commitment = createHash('sha256').update(`${rewrittenCommitment.algorithmVersion}:${rewrittenCommitment.serverSeed}`).digest('hex');
@@ -114,11 +142,11 @@ describe('server-authoritative table', () => {
     const rewrittenDeck = structuredClone(rewrittenCommitment.deck);
     for (const playerId of rewrittenCommitment.dealOrder) rewrittenCommitment.holeCards[playerId] = [rewrittenDeck.pop()!, rewrittenDeck.pop()!];
     rewrittenCommitment.board = Array.from({ length: rewrittenCommitment.board.length }, () => rewrittenDeck.pop()!);
-    expect(verifyHandAudit(rewrittenCommitment)).toBe(false);
+    expect(await verifyHandAudit(rewrittenCommitment)).toBe(false);
     for (const event of rewrittenCommitment.events.filter((item) => ['shuffle_committed', 'hand_started', 'hand_settled'].includes(item.type))) {
       event.payload.commitment = rewrittenCommitment.commitment;
     }
-    expect(verifyHandAudit(rewrittenCommitment, audit.commitment)).toBe(false);
+    expect(await verifyHandAudit(rewrittenCommitment, audit.commitment)).toBe(false);
     const replay = table.replayFor(handId, 'a');
     expect(replay.blinds).toEqual({ small: 10, big: 20 });
     expect(replay.players.find((player) => player.id === 'a')).toMatchObject({ nickname: 'Alpha', pointDelta: expect.any(Number) });
@@ -214,7 +242,7 @@ describe('server-authoritative table', () => {
     expect(JSON.stringify(table.exportState())).not.toContain(secret);
   });
 
-  it('rejects tampered board, pot and payout fields during full showdown verification', () => {
+  it('rejects tampered board, pot and payout fields during full showdown verification', async () => {
     const table = new PokerTable('room-full-verifier', 10, 20, 6);
     table.addPlayer({ id: 'a', nickname: 'Alpha', stack: 500 });
     table.addPlayer({ id: 'b', nickname: 'Bravo', stack: 500 });
@@ -224,17 +252,17 @@ describe('server-authoritative table', () => {
     table.takeAction('b', { type: 'call' });
     const audit = table.auditFor(handId, 'a');
 
-    expect(verifyHandAudit(audit)).toBe(true);
+    expect(await verifyHandAudit(audit)).toBe(true);
     const board = structuredClone(audit);
     board.board[0].rank = board.board[0].rank === 14 ? 13 : board.board[0].rank + 1;
-    expect(verifyHandAudit(board)).toBe(false);
+    expect(await verifyHandAudit(board)).toBe(false);
     const pots = structuredClone(audit);
     pots.result.pots[0].amount += 1;
-    expect(verifyHandAudit(pots)).toBe(false);
+    expect(await verifyHandAudit(pots)).toBe(false);
     const payouts = structuredClone(audit);
     const winner = Object.keys(payouts.result.payouts)[0];
     payouts.result.payouts[winner] += 1;
-    expect(verifyHandAudit(payouts)).toBe(false);
+    expect(await verifyHandAudit(payouts)).toBe(false);
   });
 
   it('keeps overflow players off physical seats until a hand boundary frees one', () => {
@@ -292,6 +320,23 @@ describe('server-authoritative table', () => {
     expect(() => table.takeAction(actor, { type: 'raise', amount: 25 })).toThrow('加注额不足');
   });
 
+  it('requires normal raises to use the small-blind denomination but permits an odd short all-in', () => {
+    const table = new PokerTable('room-chip-unit', 10, 20, 6);
+    table.addPlayer({ id: 'a', nickname: 'Alpha', stack: 500 });
+    table.addPlayer({ id: 'b', nickname: 'Bravo', stack: 500 });
+    startHand(table);
+
+    const actor = table.snapshot('a').hand!.currentPlayerId!;
+    expect(() => table.takeAction(actor, { type: 'raise', amount: 45 })).toThrow('下注必须是小盲的整数倍');
+    expect(() => table.takeAction(actor, { type: 'raise', amount: 40 })).not.toThrow();
+
+    const shortStack = new PokerTable('room-odd-all-in', 10, 20, 6);
+    shortStack.addPlayer({ id: 'a', nickname: 'Alpha', stack: 45 });
+    shortStack.addPlayer({ id: 'b', nickname: 'Bravo', stack: 500 });
+    startHand(shortStack);
+    expect(() => shortStack.takeAction('a', { type: 'raise', amount: 45 })).not.toThrow();
+  });
+
   it('keeps the full pot total after current-street bets are swept', () => {
     const table = new PokerTable('room-pot-total', 10, 20, 6);
     table.addPlayer({ id: 'a', nickname: 'Alpha', stack: 500 });
@@ -315,7 +360,9 @@ describe('server-authoritative table', () => {
     const actor = table.snapshot('a').hand?.currentPlayerId!;
     table.takeAction(actor, { type: 'fold' });
 
-    expect(table.snapshot('a').hand).toMatchObject({ status: 'settled', street: 'showdown', board: [] });
+    expect(table.snapshot('a').hand).toMatchObject({
+      status: 'settled', street: 'showdown', board: [], settlement: { settledBy: 'fold', payouts: expect.any(Object) }
+    });
   });
 
   it('does not reopen raising for a player who already acted after a short all-in raise', () => {
@@ -358,8 +405,10 @@ describe('server-authoritative table', () => {
 
     expect(table.snapshot('a').hand).toMatchObject({ currentBet: 20, legalActions: { toCall: 10, callAmount: 10 } });
     table.takeAction('a', { type: 'call' });
-    expect(table.snapshot('a').hand).toMatchObject({ status: 'settled', board: expect.any(Array) });
-    expect(table.snapshot('a').hand?.board).toHaveLength(5);
+    const settled = table.snapshot('a');
+    expect(settled.hand).toMatchObject({ status: 'settled', board: expect.any(Array), settlement: { settledBy: 'showdown', payouts: expect.any(Object) } });
+    expect(settled.hand?.board).toHaveLength(5);
+    expect(settled.players.find((player) => player.id === 'b')?.hole).toHaveLength(2);
   });
 
   it('returns an uncalled raise before constructing the final pot', () => {

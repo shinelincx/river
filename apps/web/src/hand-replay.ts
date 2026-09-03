@@ -52,6 +52,8 @@ function actionValue(value: unknown): ReplayMoment['action'] {
 }
 
 export function buildReplayStages(replay: HandReplay): ReplayStage[] {
+  if (replay.timeline) return replay.timeline;
+  /* Migration fallback for locally cached pre-projection replays. */
   const stages = new Map<ReplayStageId, ReplayStage>(
     (['preflop', 'flop', 'turn', 'river', 'result'] as const).map((id) => [id, {
       id,
@@ -64,7 +66,7 @@ export function buildReplayStages(replay: HandReplay): ReplayStage[] {
     }])
   );
 
-  for (const event of replay.events) {
+  for (const event of replay.events ?? []) {
     const payload = event.payload;
     if (event.type === 'blinds_posted') {
       stages.get('preflop')?.moments.push({

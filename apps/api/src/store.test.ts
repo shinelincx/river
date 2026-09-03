@@ -11,23 +11,59 @@ function completePreparation(table: PokerTable): void {
 }
 
 describe('room permissions and append-only ledger', () => {
-  it('creates compact readable invite codes without reducing them below 60 bits of entropy', () => {
-    const store = new RiverStore();
-    const host = store.createGuest('Host').player;
-    const room = store.createRoom(host.id, { name: 'Compact invite', maxSeats: 6, smallBlind: 10, initialChips: 500 });
-    const guest = store.createGuest('Guest').player;
-
-    expect(room.inviteCode).toMatch(/^RIVER-[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}$/);
-    expect(room.inviteCode).toHaveLength(20);
-    expect(() => store.joinByCode(guest.id, room.inviteCode)).not.toThrow();
-  });
-
   it('rejects unsupported seat counts and blind structures at runtime', () => {
     const store = new RiverStore();
     const host = store.createGuest('Host').player;
 
     expect(() => store.createRoom(host.id, { name: 'Bad seats', maxSeats: 7 as 6, smallBlind: 10, initialChips: 500 })).toThrow('座位数仅支持');
     expect(() => store.createRoom(host.id, { name: 'Bad blind', maxSeats: 6, smallBlind: 15, initialChips: 500 })).toThrow('盲注仅支持');
+  });
+
+  it('issues compact eight-character invitation codes without a fixed prefix', () => {
+    const store = new RiverStore();
+    const host = store.createGuest('Host').player;
+    const room = store.createRoom(host.id, { name: 'Compact invite', maxSeats: 6, smallBlind: 10, initialChips: 500 });
+    const firstCode = room.inviteCode;
+
+    expect(firstCode).toMatch(/^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{8}$/);
+    store.rotateInvite(host.id, room.id);
+    expect(store.rooms.get(room.id)?.inviteCode).toMatch(/^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{8}$/);
+    expect(store.rooms.get(room.id)?.inviteCode).not.toBe(firstCode);
+  });
+
+  it('allows only one ongoing host room and preserves closed-room final and top-up totals for viewing', () => {
+    const store = new RiverStore();
+    const host = store.createGuest('Host').player;
+    const guest = store.createGuest('Guest').player;
+    const room = store.createRoom(host.id, { name: 'Only room', maxSeats: 6, smallBlind: 10, initialChips: 500 });
+    store.joinByCode(guest.id, room.inviteCode);
+    store.credit(host.id, room.id, guest.id, 250, 'close-view-topup');
+
+    expect(() => store.createRoom(host.id, { name: 'Second room', maxSeats: 6, smallBlind: 10, initialChips: 500 })).toThrow('已经存在进行中的房间');
+    store.close(host.id, room.id);
+
+    expect(store.roomView(room.id, host.id).members).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: host.id, chips: 500, topupChips: 0 }),
+      expect.objectContaining({ id: guest.id, chips: 250, topupChips: 250 })
+    ]));
+    expect(store.ledgerFor(room.id, host.id)).toEqual([expect.objectContaining({ reason: 'topup', playerId: guest.id })]);
+    expect(store.roomsFor(host.id).map((item) => item.id)).toContain(room.id);
+    expect(() => store.createRoom(host.id, { name: 'Second room', maxSeats: 6, smallBlind: 10, initialChips: 500 })).not.toThrow();
+  });
+
+  it('orders a member’s rooms by state priority and newest creation time', () => {
+    const store = new RiverStore();
+    const firstHost = store.createGuest('First host').player;
+    const secondHost = store.createGuest('Second host').player;
+    const guest = store.createGuest('Guest').player;
+    const first = store.createRoom(firstHost.id, { name: 'Earlier', maxSeats: 6, smallBlind: 10, initialChips: 500 });
+    const second = store.createRoom(secondHost.id, { name: 'Later', maxSeats: 6, smallBlind: 10, initialChips: 500 });
+    store.rooms.get(first.id)!.createdAt = '2026-01-01T00:00:00.000Z';
+    store.rooms.get(second.id)!.createdAt = '2026-01-02T00:00:00.000Z';
+    store.joinByCode(guest.id, first.inviteCode);
+    store.joinByCode(guest.id, second.inviteCode);
+
+    expect(store.roomsFor(guest.id).map((item) => item.id)).toEqual([second.id, first.id]);
   });
 
   it('keeps room membership independent from physical seat capacity', () => {
@@ -135,11 +171,11 @@ describe('room permissions and append-only ledger', () => {
       expect.arrayContaining([...currentStacks])
     );
     expect(members.some((member) => member.chips !== 500)).toBe(true);
-    const settlementEntries = store.ledgerFor(room.id, host.id).filter((entry) => entry.reason === 'hand-settlement');
+    const settlementEntries = store.ledger.filter((entry) => entry.roomId === room.id && entry.reason === 'hand-settlement');
     expect(settlementEntries).toHaveLength(2);
     expect(settlementEntries.reduce((sum, entry) => sum + entry.amount, 0)).toBe(0);
     store.maybeFinalize(room.id);
-    expect(store.ledgerFor(room.id, host.id).filter((entry) => entry.reason === 'hand-settlement')).toHaveLength(2);
+    expect(store.ledger.filter((entry) => entry.roomId === room.id && entry.reason === 'hand-settlement')).toHaveLength(2);
   });
 
   it('finalizes ledger entries when blind all-ins settle during the final shuffle contribution', () => {
@@ -158,7 +194,7 @@ describe('room permissions and append-only ledger', () => {
     expect(table.snapshot(host.id).hand?.status).toBe('settled');
     store.maybeFinalize(room.id);
 
-    const settlements = store.ledgerFor(room.id, host.id).filter((entry) => entry.reason === 'hand-settlement');
+    const settlements = store.ledger.filter((entry) => entry.roomId === room.id && entry.reason === 'hand-settlement');
     expect(settlements).toHaveLength(2);
     expect(settlements.reduce((sum, entry) => sum + entry.amount, 0)).toBe(0);
   });
